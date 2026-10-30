@@ -18,7 +18,7 @@ The screenshots show demo mode.
 
 ## Why
 
-Google Calendar does a lot, and its interface shows all of it. Chronos keeps the part used every day: a clean view of your time, across all your Google accounts, in one window. It is a static site with no server and no build step, so anyone can host a copy for free.
+Google Calendar does a lot, and its interface shows all of it. Chronos keeps the part used every day: a clean view of your time, across all your Google accounts, in one window. It is a static site with no build step, plus one small Worker that keeps you signed in, so anyone can host a copy for free.
 
 ## Features
 
@@ -27,7 +27,9 @@ Google Calendar does a lot, and its interface shows all of it. Chronos keeps the
 - Drag in a column to create an event, snapped to 15 minutes
 - Several Google accounts at the same time, with calendars grouped by account
 - Create, edit, delete and move events between calendars and accounts
-- Only one occurrence changes when you edit or delete a repeating event
+- Repeating events, with daily, weekday, weekly, monthly, yearly and custom rules
+- Edit or delete one occurrence, this and the following ones, or the whole series
+- Stay signed in, with access renewed in the background
 - Mini calendar and show or hide controls for each calendar
 - Sync on focus and every 5 minutes
 - Keyboard shortcuts
@@ -46,7 +48,7 @@ Google Calendar does a lot, and its interface shows all of it. Chronos keeps the
 3. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
 4. Select the `main` branch and the `/ (root)` folder, then click **Save**.
 
-This repository's `config.js` holds a client ID that only works on its own origin. In your copy, replace it with your own, or leave it empty to run in demo mode.
+This repository's `config.js` holds a client ID and a Worker URL that only work on its own origin. In your copy, replace them with your own, or leave the client ID empty to run in demo mode. Also replace the Worker URL in the `connect-src` list of the Content Security Policy in `index.html`.
 
 ### Run locally
 
@@ -62,7 +64,7 @@ Do these steps in the [Google Cloud console](https://console.cloud.google.com/).
 
 1. Create a project.
 2. Open **APIs & Services > Library** and enable the **Google Calendar API**.
-3. Open the **OAuth consent screen**, choose **External** and add your Google accounts as **test users**.
+3. Open the **OAuth consent screen** and choose **External**. Add your home page, privacy policy and terms links.
 4. Add these scopes:
    - `https://www.googleapis.com/auth/calendar.events`
    - `https://www.googleapis.com/auth/calendar.calendarlist.readonly`
@@ -72,13 +74,27 @@ Do these steps in the [Google Cloud console](https://console.cloud.google.com/).
 6. Add these **Authorized JavaScript origins**:
    - `https://miguelsiilva1.github.io`
    - `http://localhost:8000`
-7. Copy the client ID into `config.js`:
+7. Copy the client ID into `config.js` and `worker/wrangler.toml`.
+8. Open **Audience** and click **Publish app**. Refresh tokens expire after 7 days while an app stays in test mode.
 
-   ```js
-   window.GOOGLE_CLIENT_ID = "your-client-id.apps.googleusercontent.com";
+If you host your own copy, use your own origin in step 6. The client ID is public by design, so it is safe to commit. The client secret is not: it goes only into the Worker.
+
+### Deploy the auth Worker
+
+You need a free [Cloudflare](https://www.cloudflare.com/) account.
+
+1. Set `ALLOWED_ORIGINS` in `worker/wrangler.toml` to your origins.
+2. Run these commands in the `worker` folder:
+
+   ```bash
+   npx wrangler login
+   npx wrangler deploy
+   npx wrangler secret put GOOGLE_CLIENT_SECRET
+   npx wrangler secret put SESSION_KEY
    ```
 
-If you host your own copy, use your own origin in step 6. The client ID is public by design, so it is safe to commit. There is no client secret.
+   For `SESSION_KEY`, paste the output of `openssl rand -base64 32`.
+3. Copy the Worker URL into `CHRONOS_AUTH_URL` in `config.js`.
 
 ## Keyboard shortcuts
 
@@ -101,20 +117,26 @@ Shortcuts are off while you type in a field.
 | `index.html` | Page structure and the event editor dialog |
 | `styles.css` | Design tokens, themes and layout |
 | `app.js` | Views, Google sign-in, Calendar API calls and demo mode |
-| `config.js` | The Google client ID |
+| `config.js` | The Google client ID and the Worker URL |
+| `privacy.html`, `terms.html` | Privacy policy and terms |
 | `manifest.webmanifest` | PWA name, icons and display mode |
 | `sw.js` | Caches the app shell, network first. It never touches Google requests |
+| `worker/` | Cloudflare Worker that exchanges and renews Google tokens |
 | `icons/` | App icon as SVG and PNG |
 | `docs/` | Screenshots for this README |
 
-The browser signs in directly with Google Identity Services and calls the Calendar API. No other server sees your data.
+The browser calls the Calendar API directly, so events never pass through the Worker.
+
+The Worker holds the client secret. It encrypts each refresh token with AES-GCM and returns it to the browser as an opaque session. The Worker stores nothing. Access tokens stay in memory and last 1 hour.
 
 ## Limitations
 
-- **Sessions last 1 hour.** The browser-only token model has no refresh tokens, so renewal needs a backend. When a token expires, Chronos keeps your calendar list and shows **Sessão expirada · reativar** at the top. Each click renews one account.
-- **Tokens stay in `localStorage`.** Anyone with access to your browser profile can read a token until it expires. Do not use Chronos on a shared computer.
-- **Test mode is limited to your test users.** Wider use needs Google's app verification.
+- **The app is not verified by Google.** Sign-in shows a warning, and Google caps unverified apps at 100 users for the life of the project.
+- **A session lasts until you remove the account or revoke access.** The encrypted session stays in `localStorage`, so anyone who controls your browser profile can use it. Do not use Chronos on a shared computer.
+- **Reconnecting needs one click per account.** If Google ends a session, Chronos keeps your calendar list and shows **Sessão expirada · reativar** at the top.
+- **Removing an account ends its access everywhere.** Revoking the grant also signs Chronos out on your other devices.
 - **Moving a repeating occurrence creates a new event.** The Calendar API cannot move a single instance, so Chronos creates a one-off event and deletes that occurrence. The same applies to moves between accounts. Guests and attachments are not copied.
+- **Splitting a series drops its changes.** "This and following" starts a new series, so edits to single later occurrences are lost.
 
 ## License
 

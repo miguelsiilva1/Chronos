@@ -1,0 +1,12 @@
+name = "chronos-auth"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+GOOGLE_CLIENT_ID = "180296067660-ch04ql8k8fhj6pmgjq9be0ibef5g2srn.apps.googleusercontent.com"
+ALLOWED_ORIGINS = "https://miguelsiilva1.github.io,http://localhost:8000"
+
+[[ratelimits]]
+name = "LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }

@@ -1,16 +1,17 @@
 'use strict';
 
 const CLIENT_ID = (window.GOOGLE_CLIENT_ID || '').trim();
+const AUTH_URL = (window.CHRONOS_AUTH_URL || '').trim().replace(/\/$/, '');
 const IS_DEMO = !CLIENT_ID;
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
-const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 const GIS_URL = 'https://accounts.google.com/gsi/client';
 const SCOPE_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
 const SCOPE_CALENDARS = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
 const SCOPES = [SCOPE_EVENTS, SCOPE_CALENDARS, 'openid', 'email'].join(' ');
 const GOOGLE_LINK_HOSTS = ['www.google.com', 'calendar.google.com'];
 
+const TOKEN_MARGIN = 60 * 1000;
 const SYNC_INTERVAL = 5 * 60 * 1000;
 const FOCUS_THROTTLE = 10 * 1000;
 const SNAP_MINUTES = 15;
@@ -201,7 +202,8 @@ const state = {
   miniMonth: startOfDay(new Date()),
   calendars: [],
   events: [],
-  accounts: store.get('accounts', []),
+  // Older versions stored access tokens here, so only known fields are kept.
+  accounts: store.get('accounts', []).map(({ email, session, calendars }) => ({ email, session, calendars })),
   visibility: store.get('visibility', {}),
   loaded: null,
   updatedAt: null,
@@ -212,7 +214,7 @@ const calendarByKey = key => state.calendars.find(c => c.key === key);
 const isVisible = cal => state.visibility[cal.key] ?? cal.selected;
 const titleOf = ev => ev.title || 'Sem título';
 const colorOf = ev => calendarByKey(ev.calendarKey)?.color || 'var(--text-3)';
-const isAccountLive = account => Date.now() < account.expiresAt;
+const isAccountLive = account => Boolean(account.session);
 const expiredAccounts = () => state.accounts.filter(a => !isAccountLive(a));
 const writableCalendars = () => state.calendars.filter(c => c.writable);
 
@@ -397,6 +399,8 @@ const Demo = {
 
 /* Google backend */
 
+const accessTokens = new Map();
+
 function saveAccounts() {
   store.set('accounts', state.accounts);
 }
@@ -405,20 +409,62 @@ function accountOf(calendar) {
   return state.accounts.find(a => a.email === calendar.account);
 }
 
-async function googleFetch(account, path, options = {}) {
+function authPost(path, body) {
+  return fetch(`${AUTH_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XmlHttpRequest' },
+    body: JSON.stringify(body),
+  });
+}
+
+function endSession(account) {
+  account.session = null;
+  accessTokens.delete(account.email);
+  saveAccounts();
+  renderSession();
+  return new Error(`A sessão de ${account.email} expirou. Usa "reativar" no topo.`);
+}
+
+async function fetchAccessToken(account) {
+  const res = await authPost('/auth/refresh', { session: account.session });
+  if (res.status === 401) throw endSession(account);
+  if (!res.ok) throw new Error('Não foi possível renovar o acesso. Tenta de novo.');
+  const { access_token: token, expires_in: expiresIn } = await res.json();
+  return { token, expiresAt: Date.now() + expiresIn * 1000 };
+}
+
+// Access tokens live only in memory. Concurrent callers share one refresh.
+async function accessToken(account) {
+  const current = await accessTokens.get(account.email);
+  if (current && current.expiresAt - TOKEN_MARGIN > Date.now()) return current.token;
+
+  const refreshing = fetchAccessToken(account);
+  accessTokens.set(account.email, refreshing);
+  try {
+    const fresh = await refreshing;
+    accessTokens.set(account.email, fresh);
+    return fresh.token;
+  } catch (err) {
+    accessTokens.delete(account.email);
+    throw err;
+  }
+}
+
+async function googleFetch(account, path, options = {}, isRetry = false) {
+  if (!isAccountLive(account)) throw new Error(`A sessão de ${account.email} expirou. Usa "reativar" no topo.`);
   const res = await fetch(`${CALENDAR_API}${path}`, {
     ...options,
     headers: {
-      Authorization: `Bearer ${account.token}`,
+      Authorization: `Bearer ${await accessToken(account)}`,
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     },
   });
   if (res.status === 401) {
-    account.expiresAt = 0;
-    saveAccounts();
-    renderSession();
-    throw new Error(`A sessão de ${account.email} expirou. Usa "reativar" no topo.`);
+    if (isRetry) throw endSession(account);
+    accessTokens.delete(account.email);
+    return googleFetch(account, path, options, true);
   }
+  if (res.status === 429) throw new Error('O Google recebeu demasiados pedidos. Espera um pouco e tenta de novo.');
   if (res.status === 403) throw new Error('O Google recusou esta operação: não tens permissão neste calendário ou evento.');
   if (!res.ok) throw new Error(`O Google devolveu o erro ${res.status}. Tenta de novo.`);
   return res.status === 204 ? null : res.json();
@@ -644,22 +690,27 @@ const backend = IS_DEMO ? Demo : Google;
 
 /* Google sign-in */
 
-function requestToken(loginHint, prompt) {
+function requestCode(loginHint) {
   return new Promise((resolve, reject) => {
     if (!window.google?.accounts?.oauth2) {
       reject(new Error('O início de sessão do Google ainda não carregou. Verifica a ligação e tenta de novo.'));
       return;
     }
-    const client = google.accounts.oauth2.initTokenClient({
+    const expectedState = crypto.randomUUID();
+    const client = google.accounts.oauth2.initCodeClient({
       client_id: CLIENT_ID,
       scope: SCOPES,
+      ux_mode: 'popup',
+      state: expectedState,
       login_hint: loginHint,
-      prompt,
+      select_account: !loginHint,
       callback: response => {
+        const granted = (response.scope || '').split(' ');
         if (response.error) reject(new Error(`O Google recusou o acesso (${response.error}).`));
-        else if (!google.accounts.oauth2.hasGrantedAllScopes(response, SCOPE_EVENTS, SCOPE_CALENDARS)) {
+        else if (response.state !== expectedState) reject(new Error('A resposta do Google não é válida. Tenta de novo.'));
+        else if (!granted.includes(SCOPE_EVENTS) || !granted.includes(SCOPE_CALENDARS)) {
           reject(new Error('Falta dar acesso ao calendário. Tenta de novo e marca todas as permissões.'));
-        } else resolve(response);
+        } else resolve(response.code);
       },
       error_callback: error => {
         reject(new Error(error.type === 'popup_failed_to_open'
@@ -667,25 +718,26 @@ function requestToken(loginHint, prompt) {
           : 'A janela do Google foi fechada antes de terminar.'));
       },
     });
-    client.requestAccessToken();
+    client.requestCode();
   });
 }
 
 // Must run directly from a click: the popup is blocked otherwise.
-async function connectAccount(loginHint, prompt) {
+async function connectAccount(loginHint) {
   try {
-    const token = await requestToken(loginHint, prompt);
-    const res = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${token.access_token}` } });
-    if (!res.ok) throw new Error('Não foi possível obter o email da conta. Tenta de novo.');
-    const { email } = await res.json();
+    const code = await requestCode(loginHint);
+    const res = await authPost('/auth/exchange', { code });
+    if (res.status === 409) throw new Error('O Google precisa de confirmar as permissões. Liga a conta mais uma vez.');
+    if (!res.ok) throw new Error('Não foi possível ligar a conta. Tenta de novo.');
+    const { email, session, access_token: token, expires_in: expiresIn } = await res.json();
 
     let account = state.accounts.find(a => a.email === email);
     if (!account) {
       account = { email, calendars: [] };
       state.accounts.push(account);
     }
-    account.token = token.access_token;
-    account.expiresAt = Date.now() + Number(token.expires_in) * 1000;
+    account.session = session;
+    accessTokens.set(email, { token, expiresAt: Date.now() + expiresIn * 1000 });
     saveAccounts();
     await refresh();
   } catch (err) {
@@ -694,8 +746,17 @@ async function connectAccount(loginHint, prompt) {
 }
 
 function removeAccount(account) {
+  if (account.session) authPost('/auth/revoke', { session: account.session }).catch(() => {});
+  accessTokens.delete(account.email);
   state.accounts = state.accounts.filter(a => a !== account);
   saveAccounts();
+
+  for (const key of Object.keys(state.visibility)) {
+    if (key.startsWith(`${account.email}|`)) delete state.visibility[key];
+  }
+  store.set('visibility', state.visibility);
+  if (store.get('lastCalendar', '')?.startsWith(`${account.email}|`)) store.set('lastCalendar', null);
+
   state.calendars = state.accounts.flatMap(a => a.calendars);
   state.events = state.events.filter(e => calendarByKey(e.calendarKey));
   render();
@@ -1611,11 +1672,11 @@ function bindEvents() {
   $('new-event').addEventListener('click', newEvent);
   $('toggle-sidebar').addEventListener('click', toggleSidebar);
   $('scrim').addEventListener('click', closeDrawer);
-  $('add-account').addEventListener('click', () => connectAccount('', 'select_account'));
+  $('add-account').addEventListener('click', () => connectAccount(''));
   $('reauth').addEventListener('click', () => {
     // One popup per click: a second one would be blocked after the first closes.
     const [account] = expiredAccounts();
-    if (account) connectAccount(account.email, '');
+    if (account) connectAccount(account.email);
   });
 
   for (const button of $('views').children) {

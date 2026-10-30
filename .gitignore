@@ -13,4 +13,6 @@ dist/
 
 # Local files
 .env
+.dev.vars
+.wrangler/
 *.zip
