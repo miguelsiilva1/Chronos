@@ -1,4 +1,4 @@
-const CACHE = 'chronos-v5';
+const CACHE = 'chronos-v6';
 
 const SHELL = [
   './',

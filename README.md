@@ -22,9 +22,12 @@ Google Calendar does a lot, and its interface shows all of it. Chronos keeps the
 
 ## Features
 
-- Day, week and month views, with the week starting on Monday and a 24-hour clock
+- Day, week, month and agenda views, with the week starting on Monday and a 24-hour clock
 - Red "now" line in the day and week views, updated every minute
 - Drag in a column to create an event, snapped to 15 minutes
+- Drag events to move them, and drag their bottom edge to change their length
+- Search across all calendars by title, location or notes
+- Duplicate an event
 - Several Google accounts at the same time, with calendars grouped by account
 - Create, edit, delete and move events between calendars and accounts
 - Repeating events, with daily, weekday, weekly, monthly, yearly and custom rules
@@ -109,7 +112,9 @@ You need a free [Cloudflare](https://www.cloudflare.com/) account.
 | `D` | Day view |
 | `S` | Week view (*semana*) |
 | `M` | Month view |
+| `A` | Agenda view |
 | `N` | New event |
+| `/` | Search |
 | `Esc` | Close |
 
 Shortcuts are off while you type in a field. To reorder a calendar with the keyboard, focus it and press `Alt` + `↑` or `↓`.

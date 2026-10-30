@@ -63,10 +63,14 @@
         <span class="status" id="status"></span>
         <button class="btn btn-session" id="reauth" type="button" hidden></button>
         <span class="topbar-gap"></span>
+        <button class="icon-btn btn-search" id="open-search" type="button" aria-label="Pesquisar eventos" title="Pesquisar (/)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+        </button>
         <div class="segmented" id="views" role="group" aria-label="Vista">
           <button type="button" data-view="day">Dia</button>
           <button type="button" data-view="week">Semana</button>
           <button type="button" data-view="month">Mês</button>
+          <button type="button" data-view="agenda">Agenda</button>
         </div>
         <div class="nav">
           <button class="icon-btn" id="prev" type="button" aria-label="Anterior">
@@ -164,6 +168,17 @@
         <button class="btn btn-primary" id="ed-save" type="submit">Guardar</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog class="editor scope-dialog" id="scope-dialog" aria-labelledby="scope-title">
+    <h2 id="scope-title">Este evento repete-se</h2>
+    <p>Aplicar a alteração a:</p>
+    <div class="scope-actions">
+      <button class="btn" type="button" value="this">Só este evento</button>
+      <button class="btn" type="button" value="following">Este e os seguintes</button>
+      <button class="btn" type="button" value="all">Todos os eventos</button>
+      <button class="btn" type="button" value="">Cancelar</button>
+    </div>
   </dialog>
 
   <dialog class="editor" id="cal-editor" aria-labelledby="cal-editor-title">

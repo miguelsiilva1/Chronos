@@ -30,6 +30,12 @@ const RRULE_DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
 const RRULE_FREQS = ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'];
 const MAX_OCCURRENCES = 2000;
 const PANEL_DAYS = 90;
+const AGENDA_DAYS = 30;
+const LOADED_DAYS = 70;
+const DRAG_THRESHOLD = 5;
+const SEARCH_DELAY = 300;
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_RESULTS_PER_CALENDAR = 50;
 const CALENDAR_COLORS = ['#d50000', '#e67c73', '#f4511e', '#f6bf26', '#33b679', '#0b8043', '#039be5', '#3f51b5', '#7986cb', '#8e24aa', '#616161', '#795548'];
 
 const $ = id => document.getElementById(id);
@@ -149,6 +155,17 @@ function shiftSeries(series, ev, d) {
   const start = d.allDay ? startOfDay(day) : atMinutes(day, minutesOf(d.start));
   const end = d.allDay ? addDays(start, dayDiff(d.start, d.end)) : new Date(start.getTime() + (d.end - d.start));
   return { ...d, start, end };
+}
+
+// Moving a weekly event to another weekday moves that day in its rule too.
+function retargetRecurrence(recurrence, from, to, allDay) {
+  const oldDay = RRULE_DAYS[weekdayIndex(from)];
+  const newDay = RRULE_DAYS[weekdayIndex(to)];
+  return recurrence.map(line => {
+    const rule = isRRule(line) ? parseRule(line) : null;
+    if (oldDay === newDay || !rule?.byDay?.includes(oldDay)) return line;
+    return formatRule({ ...rule, byDay: [...new Set(rule.byDay.map(d => (d === oldDay ? newDay : d)))] }, allDay);
+  });
 }
 
 const isFirstOccurrence = (ev, series) => (ev.originalStart || ev.start).getTime() === series.start.getTime();
@@ -370,6 +387,14 @@ const Demo = {
       .filter(e => e.calendarId === calendar.key)
       .flatMap(e => demoExpand(e, to))
       .filter(e => e.start < to && e.end > from);
+  },
+
+  async search(query, from, to) {
+    const text = query.toLowerCase();
+    return demoData().events
+      .filter(e => [e.title, e.location, e.notes].some(field => field.toLowerCase().includes(text)))
+      .flatMap(e => demoExpand(e, to))
+      .filter(e => e.end > from);
   },
 
   async createCalendar({ name, color }) {
@@ -660,6 +685,24 @@ const Google = {
     return items.filter(i => i.status !== 'cancelled').map(i => fromGoogle(i, calendar));
   },
 
+  async search(query, from, to) {
+    const params = new URLSearchParams({
+      q: query,
+      timeMin: from.toISOString(),
+      timeMax: to.toISOString(),
+      singleEvents: 'true',
+      orderBy: 'startTime',
+      maxResults: SEARCH_RESULTS_PER_CALENDAR,
+    });
+    const calendars = state.accounts.filter(isAccountLive).flatMap(a => a.calendars);
+    const results = await Promise.allSettled(calendars.map(async calendar => {
+      const page = await googleFetch(accountOf(calendar), `${eventsPath(calendar)}?${params}`);
+      return (page.items || []).filter(i => i.status !== 'cancelled').map(i => fromGoogle(i, calendar));
+    }));
+    if (calendars.length && results.every(r => r.status === 'rejected')) throw new Error('Não foi possível pesquisar.');
+    return results.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+  },
+
   async createCalendar({ email, name, color }) {
     const account = state.accounts.find(a => a.email === email);
     const created = await googleFetch(account, '/calendars', {
@@ -875,16 +918,17 @@ function monthGridStart(date) {
   return startOfWeek(new Date(date.getFullYear(), date.getMonth(), 1));
 }
 
+// Reaches past the month grid so the agenda always has its 30 days.
 function loadRange(date) {
   const first = monthGridStart(date);
-  return { from: addDays(first, -7), to: addDays(first, 49) };
+  return { from: addDays(first, -7), to: addDays(first, LOADED_DAYS) };
 }
 
 function isLoaded(date) {
   const { loaded } = state;
   if (!loaded) return false;
-  const grid = monthGridStart(date);
-  return grid >= loaded.from && addDays(grid, 42) <= loaded.to;
+  const { from, to } = loadRange(date);
+  return from >= loaded.from && to <= loaded.to;
 }
 
 let refreshRun = 0;
@@ -905,6 +949,7 @@ async function refresh() {
   }
   render();
   if (panel.calendarKey) loadCalendarPanel();
+  if (panel.searching) runSearch();
 }
 
 /* Navigation */
@@ -922,8 +967,9 @@ function goTo(date, view) {
 }
 
 function step(direction) {
+  const stepDays = { day: 1, week: 7, agenda: AGENDA_DAYS };
   if (state.view === 'month') goTo(addMonths(state.date, direction));
-  else goTo(addDays(state.date, direction * (state.view === 'week' ? 7 : 1)));
+  else goTo(addDays(state.date, direction * stepDays[state.view]));
 }
 
 /* Rendering */
@@ -943,7 +989,7 @@ function render() {
 
 function titleParts() {
   const d = state.date;
-  if (state.view === 'month') return [MONTHS[d.getMonth()], d.getFullYear()];
+  if (state.view === 'month' || state.view === 'agenda') return [MONTHS[d.getMonth()], d.getFullYear()];
   if (state.view === 'day') return [`${d.getDate()} de ${MONTHS[d.getMonth()].toLowerCase()}`, d.getFullYear()];
 
   const a = startOfWeek(d);
@@ -987,8 +1033,9 @@ function renderMini() {
 
   const today = new Date();
   const first = monthGridStart(month);
-  const rangeStart = state.view === 'month' ? null : viewDays()[0];
-  const rangeEnd = state.view === 'month' ? null : viewDays().at(-1);
+  const hasRange = state.view === 'day' || state.view === 'week';
+  const rangeStart = hasRange ? viewDays()[0] : null;
+  const rangeEnd = hasRange ? viewDays().at(-1) : null;
 
   const cells = DAYS_MINI.map(label => h('div', { class: 'mini-label' }, label));
   for (let i = 0; i < 42; i++) {
@@ -1064,6 +1111,13 @@ function saveCalendarOrder() {
 
 let calendarDragActive = false;
 
+// The click that ends a drag must not also activate what is under the pointer.
+function swallowNextClick() {
+  const swallow = ev => ev.stopPropagation();
+  document.addEventListener('click', swallow, { capture: true, once: true });
+  setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 0);
+}
+
 function startCalendarDrag(e) {
   const row = e.currentTarget;
   const onGrip = e.target.closest('.cal-grip');
@@ -1096,10 +1150,7 @@ function startCalendarDrag(e) {
     row.classList.remove('is-dragging');
     saveCalendarOrder();
 
-    // The click that ends a drag must not open the calendar's panel.
-    const swallow = ev => ev.stopPropagation();
-    document.addEventListener('click', swallow, { capture: true, once: true });
-    setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 0);
+    swallowNextClick();
   };
 
   document.addEventListener('pointermove', move);
@@ -1120,7 +1171,111 @@ function moveCalendarWithKeys(e) {
 
 function renderView() {
   if (state.view === 'month') renderMonth();
+  else if (state.view === 'agenda') renderAgenda();
   else renderTimeView(viewDays());
+}
+
+/* Agenda view */
+
+function agendaEvent(ev) {
+  return h('button', { class: 'agenda-ev', type: 'button', '--c': colorOf(ev), onclick: e => openPopover(ev, e.currentTarget) },
+    h('time', {}, inAllDayRow(ev) ? 'Dia todo' : `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`),
+    h('strong', {}, titleOf(ev)),
+    ev.location && h('span', {}, ev.location),
+  );
+}
+
+function renderAgenda() {
+  const today = new Date();
+  const events = visibleEvents();
+  const days = Array.from({ length: AGENDA_DAYS }, (_, i) => addDays(state.date, i));
+
+  const sections = days.flatMap(day => {
+    const next = addDays(day, 1);
+    const items = events
+      .filter(ev => ev.start < next && ev.end > day)
+      .sort((a, b) => inAllDayRow(b) - inAllDayRow(a) || a.start - b.start);
+    if (!items.length) return [];
+    return h('section', { class: sameDay(day, today) ? 'agenda-day is-today' : 'agenda-day' },
+      h('button', { class: 'agenda-date', type: 'button', 'aria-label': fmtLong(day), onclick: () => goTo(day, 'day') },
+        h('b', {}, day.getDate()),
+        h('span', {}, DAYS_SHORT[weekdayIndex(day)]),
+      ),
+      h('div', { class: 'agenda-items' }, items.map(agendaEvent)),
+    );
+  });
+
+  $('view').replaceChildren(h('div', { class: 'agenda' },
+    sections.length ? sections : h('p', { class: 'agenda-empty' }, `Sem eventos nos próximos ${AGENDA_DAYS} dias.`),
+  ));
+}
+
+/* Search */
+
+let searchTimer;
+
+function openSearch() {
+  closePopover();
+  closeDrawer();
+  panel.calendarKey = null;
+  panel.run++;
+  panel.searching = true;
+  renderSidebar();
+
+  const input = h('input', {
+    class: 'input',
+    id: 'search-input',
+    type: 'search',
+    placeholder: 'Título, local ou notas',
+    'aria-label': 'Pesquisar eventos',
+    autocomplete: 'off',
+    oninput: () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(runSearch, SEARCH_DELAY);
+    },
+  });
+
+  $('cal-panel').replaceChildren(
+    h('header', { class: 'panel-head' },
+      h('h2', {}, 'Pesquisar'),
+      h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Fechar', onclick: closeCalendarPanel }, '×'),
+    ),
+    input,
+    h('p', { class: 'panel-summary', id: 'search-summary' }),
+    h('div', { class: 'panel-list', id: 'search-results' }),
+  );
+  $('cal-panel').hidden = false;
+  input.focus();
+}
+
+function renderSearchResults(events) {
+  $('search-summary').textContent = `${events.length} ${events.length === 1 ? 'resultado' : 'resultados'}`;
+  $('search-results').replaceChildren(...eventsByDay(events).map(({ day, events: items }) => daySection(day, items, true)));
+}
+
+async function runSearch() {
+  const query = $('search-input')?.value.trim() || '';
+  const run = ++panel.run;
+  if (query.length < SEARCH_MIN_CHARS) {
+    $('search-summary').textContent = '';
+    $('search-results').replaceChildren();
+    return;
+  }
+
+  const today = startOfDay(new Date());
+  $('search-summary').textContent = 'A pesquisar...';
+  try {
+    const found = await backend.search(query, addDays(today, -365), addDays(today, 730));
+    if (run !== panel.run) return;
+    // Upcoming events first, then past ones from the most recent.
+    const upcoming = found.filter(ev => ev.end > today).sort((a, b) => a.start - b.start);
+    const past = found.filter(ev => ev.end <= today).sort((a, b) => b.start - a.start);
+    renderSearchResults([...upcoming, ...past]);
+  } catch (err) {
+    if (run !== panel.run) return;
+    $('search-summary').textContent = err.message;
+    $('search-results').replaceChildren();
+  }
 }
 
 /* Calendar panel */
@@ -1131,6 +1286,7 @@ const panel = {
   events: [],
   loading: false,
   failed: false,
+  searching: false,
   run: 0,
 };
 
@@ -1141,13 +1297,15 @@ function toggleCalendarPanel(cal) {
   }
   closePopover();
   closeDrawer();
-  Object.assign(panel, { calendarKey: cal.key, days: PANEL_DAYS, events: [], failed: false });
+  Object.assign(panel, { calendarKey: cal.key, days: PANEL_DAYS, events: [], failed: false, searching: false });
   renderSidebar();
   loadCalendarPanel();
 }
 
 function closeCalendarPanel() {
+  clearTimeout(searchTimer);
   panel.calendarKey = null;
+  panel.searching = false;
   panel.run++;
   $('cal-panel').hidden = true;
   renderSidebar();
@@ -1176,11 +1334,11 @@ async function loadCalendarPanel() {
   renderCalendarPanel();
 }
 
-function panelDays() {
-  const today = startOfDay(new Date());
+// Events already under way can be listed from `earliest` instead of their start day.
+function eventsByDay(events, earliest) {
   const days = new Map();
-  for (const ev of panel.events) {
-    const day = ev.start < today ? today : startOfDay(ev.start);
+  for (const ev of events) {
+    const day = earliest && ev.start < earliest ? earliest : startOfDay(ev.start);
     const key = fmtDateValue(day);
     if (!days.has(key)) days.set(key, { day, events: [] });
     days.get(key).events.push(ev);
@@ -1188,10 +1346,18 @@ function panelDays() {
   return [...days.values()];
 }
 
-function panelEvent(ev) {
-  return h('button', { class: 'panel-ev', type: 'button', onclick: e => openPopover(ev, e.currentTarget) },
+function panelEvent(ev, showColor) {
+  return h('button', { class: 'panel-ev', type: 'button', '--c': colorOf(ev), onclick: e => openPopover(ev, e.currentTarget) },
     h('time', {}, inAllDayRow(ev) ? 'Dia todo' : fmtTime(ev.start)),
-    h('span', {}, titleOf(ev)),
+    h('span', {}, showColor && h('i', {}), titleOf(ev)),
+  );
+}
+
+function daySection(day, events, showColor) {
+  const year = day.getFullYear() === new Date().getFullYear() ? '' : ` de ${day.getFullYear()}`;
+  return h('section', { class: 'panel-day' },
+    h('button', { class: 'panel-date', type: 'button', onclick: () => goTo(day, 'day') }, `${fmtLong(day)}${year}`),
+    events.map(ev => panelEvent(ev, showColor)),
   );
 }
 
@@ -1207,10 +1373,7 @@ function renderCalendarPanel() {
   else if (panel.loading && !count) body = h('p', { class: 'panel-note' }, 'A carregar...');
   else if (!count) body = h('p', { class: 'panel-note' }, `Sem eventos nos próximos ${panel.days} dias.`);
   else {
-    body = panelDays().map(({ day, events }) => h('section', { class: 'panel-day' },
-      h('button', { class: 'panel-date', type: 'button', onclick: () => goTo(day, 'day') }, fmtLong(day)),
-      events.map(panelEvent),
-    ));
+    body = eventsByDay(panel.events, startOfDay(new Date())).map(({ day, events }) => daySection(day, events, false));
   }
 
   element.replaceChildren(
@@ -1369,7 +1532,7 @@ function timedSegments(day) {
     .map(ev => {
       const start = ev.start < day ? 0 : minutesOf(ev.start);
       const end = ev.end >= next ? DAY_MINUTES : minutesOf(ev.end);
-      return { ev, start, end: Math.min(DAY_MINUTES, Math.max(end, start + MIN_EVENT_MINUTES)) };
+      return { ev, day, start, end: Math.min(DAY_MINUTES, Math.max(end, start + MIN_EVENT_MINUTES)), endsToday: ev.end <= next };
     });
 }
 
@@ -1413,10 +1576,12 @@ function eventBlock(seg) {
     '--cols': seg.cols,
     '--c': colorOf(ev),
     onclick: e => openPopover(ev, e.currentTarget),
+    onpointerdown: e => startEventDrag(e, seg),
   },
     h('strong', {}, titleOf(ev)),
     h('span', {}, isShort ? fmtTime(ev.start) : time),
     !isShort && ev.location && h('span', {}, ev.location),
+    seg.endsToday && canEdit(ev) && h('i', { class: 'ev-resize', title: 'Arrastar para mudar a duração' }),
   );
 }
 
@@ -1439,6 +1604,7 @@ function renderTimeView(days) {
 
   const allDayCells = days.map(day => h('div', {
     class: 'tv-allday-cell',
+    'data-date': fmtDateValue(day),
     ondblclick: () => openEditor(null, { allDay: true, start: day, end: addDays(day, 1) }),
   }));
 
@@ -1451,6 +1617,7 @@ function renderTimeView(days) {
     '--c': colorOf(ev),
     title: titleOf(ev),
     onclick: e => openPopover(ev, e.currentTarget),
+    onpointerdown: e => startDayDrag(e, ev, '.tv-allday-cell'),
   }, titleOf(ev)));
 
   const hours = Array.from({ length: 23 }, (_, i) => h('div', { class: 'tv-hour', '--h': i + 1, 'data-hour': i + 1 }, `${pad(i + 1)}:00`));
@@ -1517,11 +1684,14 @@ function dragRange() {
   return { start: Math.min(drag.anchor, drag.current), end: Math.max(drag.anchor, drag.current) };
 }
 
-function pointerMinutes(e, column) {
+const snapMinutes = minutes => Math.min(DAY_MINUTES, Math.max(0, Math.round(minutes / SNAP_MINUTES) * SNAP_MINUTES));
+
+function rawPointerMinutes(e, column) {
   const rect = column.getBoundingClientRect();
-  const minutes = ((e.clientY - rect.top) / rect.height) * DAY_MINUTES;
-  return Math.min(DAY_MINUTES, Math.max(0, Math.round(minutes / SNAP_MINUTES) * SNAP_MINUTES));
+  return ((e.clientY - rect.top) / rect.height) * DAY_MINUTES;
 }
+
+const pointerMinutes = (e, column) => snapMinutes(rawPointerMinutes(e, column));
 
 function openDraft(day, start, end) {
   const from = start === end ? Math.min(start, DAY_MINUTES - 60) : start;
@@ -1580,20 +1750,169 @@ function tapCreate(e) {
   openDraft(parseDateValue(column.dataset.date), minutes, minutes);
 }
 
-function drawGhost() {
-  const { start, end } = dragRange();
-  if (!drag.ghost) {
-    drag.ghost = h('div', { class: 'ev ev--ghost', '--col': 0, '--cols': 1, '--c': defaultCalendar()?.color || 'var(--accent)' }, h('span', {}));
-    drag.column.append(drag.ghost);
-  }
+function paintGhost(column, day, start, end, color) {
+  if (!drag.ghost) drag.ghost = h('div', { class: 'ev ev--ghost', '--col': 0, '--cols': 1, '--c': color }, h('span', {}));
+  if (drag.ghost.parentElement !== column) column.append(drag.ghost);
   drag.ghost.style.setProperty('--top', start);
   drag.ghost.style.setProperty('--dur', Math.max(end - start, SNAP_MINUTES));
-  drag.ghost.firstChild.textContent = `${fmtTime(atMinutes(drag.day, start))} – ${fmtTime(atMinutes(drag.day, end))}`;
+  drag.ghost.firstChild.textContent = `${fmtTime(atMinutes(day, start))} – ${fmtTime(atMinutes(day, end))}`;
+}
+
+function drawGhost() {
+  const { start, end } = dragRange();
+  paintGhost(drag.column, drag.day, start, end, defaultCalendar()?.color || 'var(--accent)');
 }
 
 function cancelDrag() {
   drag?.ghost?.remove();
   drag = null;
+}
+
+/* Drag events */
+
+const canEdit = ev => Boolean(calendarByKey(ev.calendarKey)?.writable);
+const elementAt = (e, selector) => document.elementsFromPoint(e.clientX, e.clientY).find(el => el.matches(selector));
+
+function trackDrag(e, { start, move, end }) {
+  const { clientX: x, clientY: y } = e;
+  let active = false;
+
+  const onMove = ev => {
+    if (!active) {
+      if (Math.hypot(ev.clientX - x, ev.clientY - y) < DRAG_THRESHOLD) return;
+      active = true;
+      start();
+    }
+    if (drag) move(ev);
+  };
+
+  const onEnd = ev => {
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onEnd);
+    document.removeEventListener('pointercancel', onEnd);
+    if (!active) return;
+    swallowNextClick();
+    end(ev.type === 'pointerup' && Boolean(drag));
+  };
+
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onEnd);
+  document.addEventListener('pointercancel', onEnd);
+}
+
+function finishDrag() {
+  const pending = drag?.renderPending;
+  cancelDrag();
+  if (pending) render();
+}
+
+function startEventDrag(e, seg) {
+  const { ev, day } = seg;
+  if (e.button !== 0 || e.pointerType === 'touch' || !canEdit(ev)) return;
+
+  const source = e.currentTarget;
+  const column = source.closest('.tv-col');
+  const resizing = Boolean(e.target.closest('.ev-resize'));
+  const grab = rawPointerMinutes(e, column) - seg.start;
+  const length = seg.end - seg.start;
+  const target = { day, start: seg.start, end: seg.end };
+
+  trackDrag(e, {
+    start() {
+      drag = { ghost: null, renderPending: false };
+      source.classList.add('is-moving');
+    },
+    move(ev2) {
+      if (resizing) {
+        target.end = Math.max(seg.start + SNAP_MINUTES, pointerMinutes(ev2, column));
+        paintGhost(column, day, target.start, target.end, colorOf(ev));
+        return;
+      }
+      const over = elementAt(ev2, '.tv-col') || drag.column || column;
+      drag.column = over;
+      target.day = parseDateValue(over.dataset.date);
+      target.start = Math.min(DAY_MINUTES - SNAP_MINUTES, snapMinutes(rawPointerMinutes(ev2, over) - grab));
+      target.end = target.start + length;
+      paintGhost(over, target.day, target.start, Math.min(DAY_MINUTES, target.end), colorOf(ev));
+    },
+    end(commit) {
+      source.classList.remove('is-moving');
+      finishDrag();
+      if (!commit) return;
+      if (resizing) {
+        rescheduleEvent(ev, ev.start, atMinutes(day, target.end));
+        return;
+      }
+      const start = atMinutes(addDays(startOfDay(ev.start), dayDiff(day, target.day)), minutesOf(ev.start) + target.start - seg.start);
+      rescheduleEvent(ev, start, new Date(start.getTime() + (ev.end - ev.start)));
+    },
+  });
+}
+
+function startDayDrag(e, ev, selector) {
+  if (e.button !== 0 || e.pointerType === 'touch' || !canEdit(ev)) return;
+
+  const source = e.currentTarget;
+  const origin = parseDateValue(elementAt(e, selector).dataset.date);
+  let cell = null;
+
+  trackDrag(e, {
+    start() {
+      drag = { ghost: null, renderPending: false };
+      source.classList.add('is-moving');
+    },
+    move(ev2) {
+      const over = elementAt(ev2, selector) || null;
+      if (over === cell) return;
+      cell?.classList.remove('is-drop');
+      over?.classList.add('is-drop');
+      cell = over;
+    },
+    end(commit) {
+      cell?.classList.remove('is-drop');
+      source.classList.remove('is-moving');
+      finishDrag();
+      if (!commit || !cell) return;
+      const days = dayDiff(origin, parseDateValue(cell.dataset.date));
+      rescheduleEvent(ev, addDays(ev.start, days), addDays(ev.end, days));
+    },
+  });
+}
+
+function askScope() {
+  const dialog = $('scope-dialog');
+  return new Promise(resolve => {
+    dialog.returnValue = '';
+    dialog.addEventListener('close', () => resolve(dialog.returnValue || null), { once: true });
+    dialog.showModal();
+  });
+}
+
+async function rescheduleEvent(ev, start, end) {
+  if (start.getTime() === ev.start.getTime() && end.getTime() === ev.end.getTime()) return;
+
+  const scope = ev.recurring ? await askScope() : 'this';
+  if (!scope) return;
+
+  try {
+    const series = scope === 'this' ? null : await backend.getSeries(ev);
+    const original = { ...ev };
+    Object.assign(ev, { start, end });
+    render();
+    await backend.update(original, {
+      title: ev.title,
+      allDay: ev.allDay,
+      start,
+      end,
+      calendarKey: ev.calendarKey,
+      location: ev.location,
+      notes: ev.notes,
+      recurrence: series ? retargetRecurrence(series.recurrence, original.start, start, ev.allDay) : [],
+    }, scope);
+  } catch (err) {
+    toast(err.message);
+  }
+  await refresh();
 }
 
 /* Month view */
@@ -1611,6 +1930,7 @@ function renderMonth() {
     if (isWeekend(day)) classes.push('is-weekend');
     return h('div', {
       class: classes.join(' '),
+      'data-date': fmtDateValue(day),
       ondblclick: e => {
         if (e.target.closest('button')) return;
         openEditor(null, { allDay: true, start: day, end: addDays(day, 1) });
@@ -1663,6 +1983,7 @@ function monthEvent(ev) {
     '--c': colorOf(ev),
     title: titleOf(ev),
     onclick: e => openPopover(ev, e.currentTarget),
+    onpointerdown: e => startDayDrag(e, ev, '.m-day'),
   },
     !allDay && h('i', {}),
     h('span', {}, titleOf(ev)),
@@ -1683,11 +2004,18 @@ function whenText(ev) {
   return `${fmtLong(ev.start)}, ${fmtTime(ev.start)} – ${fmtLong(ev.end)}, ${fmtTime(ev.end)}`;
 }
 
+// The copy is a single event, even when the original repeats.
+function duplicateEvent(ev) {
+  const { title, allDay, start, end, location, notes } = ev;
+  openEditor(null, { title, allDay, start, end, location, notes, calendarKey: canEdit(ev) ? ev.calendarKey : null });
+}
+
 function popoverActions(ev, calendar) {
-  const canEdit = calendar?.writable;
+  const editable = calendar?.writable;
   return h('div', { class: 'pop-actions' },
-    canEdit && h('button', { class: 'btn', type: 'button', onclick: () => { closePopover(); openEditor(ev); } }, 'Editar'),
-    canEdit && h('button', { class: 'btn btn-danger', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(confirmDelete(ev, calendar)) }, 'Apagar'),
+    editable && h('button', { class: 'btn', type: 'button', onclick: () => { closePopover(); openEditor(ev); } }, 'Editar'),
+    h('button', { class: 'btn', type: 'button', onclick: () => duplicateEvent(ev) }, 'Duplicar'),
+    editable && h('button', { class: 'btn btn-danger', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(confirmDelete(ev, calendar)) }, 'Apagar'),
     ev.link && h('a', { class: 'btn', href: ev.link, target: '_blank', rel: 'noopener noreferrer' }, 'Abrir no Google'),
   );
 }
@@ -1926,15 +2254,15 @@ async function openEditor(ev, draft) {
   const lastDay = allDay ? addDays(source.end, -1) : source.end;
 
   $('editor-title').textContent = ev ? 'Editar evento' : 'Novo evento';
-  $('ed-title').value = ev ? ev.title : '';
+  $('ed-title').value = source.title || '';
   $('ed-allday').checked = allDay;
   $('ed-start-date').value = fmtDateValue(source.start);
   $('ed-end-date').value = fmtDateValue(lastDay);
   $('ed-start-time').value = allDay ? '09:00' : fmtTime(source.start);
   $('ed-end-time').value = allDay ? '10:00' : fmtTime(source.end);
-  $('ed-location').value = ev ? ev.location : '';
-  $('ed-notes').value = ev ? ev.notes : '';
-  fillCalendarSelect(ev ? ev.calendarKey : defaultCalendar().key);
+  $('ed-location').value = source.location || '';
+  $('ed-notes').value = source.notes || '';
+  fillCalendarSelect(source.calendarKey || defaultCalendar().key);
 
   $('ed-scope').hidden = !ev?.recurring;
   document.querySelector('input[name="ed-scope"][value="this"]').checked = true;
@@ -2079,6 +2407,11 @@ function bindEvents() {
   $('mini-prev').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, -1); renderMini(); });
   $('mini-next').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, 1); renderMini(); });
 
+  $('open-search').addEventListener('click', openSearch);
+  $('scope-dialog').addEventListener('click', e => {
+    const button = e.target.closest('button');
+    if (button) $('scope-dialog').close(button.value);
+  });
   $('new-calendar').addEventListener('click', () => openCalendarEditor(null));
   $('cal-form').addEventListener('submit', saveCalendar);
   $('cal-cancel').addEventListener('click', () => $('cal-editor').close());
@@ -2174,13 +2507,13 @@ function onKeydown(e) {
       if (renderPending) render();
     }
     if (!$('popover').hidden) closePopover();
-    else if (panel.calendarKey && !$('cal-editor').open) closeCalendarPanel();
+    else if ((panel.calendarKey || panel.searching) && !document.querySelector('dialog[open]')) closeCalendarPanel();
     closeDrawer();
     return;
   }
 
   const typing = e.target.closest?.('input:not([type="checkbox"]), textarea, select, [contenteditable]');
-  if (typing || e.ctrlKey || e.metaKey || e.altKey || $('editor').open || $('cal-editor').open) return;
+  if (typing || e.ctrlKey || e.metaKey || e.altKey || document.querySelector('dialog[open]')) return;
 
   const actions = {
     arrowleft: () => step(-1),
@@ -2189,7 +2522,9 @@ function onKeydown(e) {
     d: () => goTo(state.date, 'day'),
     s: () => goTo(state.date, 'week'),
     m: () => goTo(state.date, 'month'),
+    a: () => goTo(state.date, 'agenda'),
     n: newEvent,
+    '/': openSearch,
   };
   const action = actions[e.key.toLowerCase()];
   if (action) {
