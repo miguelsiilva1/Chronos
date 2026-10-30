@@ -31,6 +31,9 @@ Google Calendar does a lot, and its interface shows all of it. Chronos keeps the
 - Edit or delete one occurrence, this and the following ones, or the whole series
 - Stay signed in, with access renewed in the background
 - Mini calendar and show or hide controls for each calendar
+- Create, rename, recolour and delete calendars
+- Drag calendars to reorder them. The order stays in your browser
+- Side panel with the upcoming events of a calendar
 - Sync on focus and every 5 minutes
 - Keyboard shortcuts
 - Automatic light and dark themes
@@ -67,7 +70,8 @@ Do these steps in the [Google Cloud console](https://console.cloud.google.com/).
 3. Open the **OAuth consent screen** and choose **External**. Add your home page, privacy policy and terms links.
 4. Add these scopes:
    - `https://www.googleapis.com/auth/calendar.events`
-   - `https://www.googleapis.com/auth/calendar.calendarlist.readonly`
+   - `https://www.googleapis.com/auth/calendar.calendarlist`
+   - `https://www.googleapis.com/auth/calendar.calendars`
    - `openid`
    - `email`
 5. Open **Credentials** and create an **OAuth client ID** of type **Web application**.
@@ -108,7 +112,7 @@ You need a free [Cloudflare](https://www.cloudflare.com/) account.
 | `N` | New event |
 | `Esc` | Close |
 
-Shortcuts are off while you type in a field.
+Shortcuts are off while you type in a field. To reorder a calendar with the keyboard, focus it and press `Alt` + `↑` or `↓`.
 
 ## How it works
 

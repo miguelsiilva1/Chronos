@@ -7,8 +7,9 @@ const IS_DEMO = !CLIENT_ID;
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const GIS_URL = 'https://accounts.google.com/gsi/client';
 const SCOPE_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
-const SCOPE_CALENDARS = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
-const SCOPES = [SCOPE_EVENTS, SCOPE_CALENDARS, 'openid', 'email'].join(' ');
+const SCOPE_CALENDARS = 'https://www.googleapis.com/auth/calendar.calendarlist';
+const SCOPE_MANAGE = 'https://www.googleapis.com/auth/calendar.calendars';
+const SCOPES = [SCOPE_EVENTS, SCOPE_CALENDARS, SCOPE_MANAGE, 'openid', 'email'].join(' ');
 const GOOGLE_LINK_HOSTS = ['www.google.com', 'calendar.google.com'];
 
 const TOKEN_MARGIN = 60 * 1000;
@@ -28,6 +29,8 @@ const DAYS_MINI = ['S', 'T', 'Q', 'Q', 'S', 'S', 'D'];
 const RRULE_DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
 const RRULE_FREQS = ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'];
 const MAX_OCCURRENCES = 2000;
+const PANEL_DAYS = 90;
+const CALENDAR_COLORS = ['#d50000', '#e67c73', '#f4511e', '#f6bf26', '#33b679', '#0b8043', '#039be5', '#3f51b5', '#7986cb', '#8e24aa', '#616161', '#795548'];
 
 const $ = id => document.getElementById(id);
 
@@ -203,7 +206,8 @@ const state = {
   calendars: [],
   events: [],
   // Older versions stored access tokens here, so only known fields are kept.
-  accounts: store.get('accounts', []).map(({ email, session, calendars }) => ({ email, session, calendars })),
+  accounts: store.get('accounts', []).map(({ email, session, calendars, scopes }) => ({ email, session, calendars, scopes })),
+  order: store.get('calendarOrder', []),
   visibility: store.get('visibility', {}),
   loaded: null,
   updatedAt: null,
@@ -215,8 +219,19 @@ const isVisible = cal => state.visibility[cal.key] ?? cal.selected;
 const titleOf = ev => ev.title || 'Sem título';
 const colorOf = ev => calendarByKey(ev.calendarKey)?.color || 'var(--text-3)';
 const isAccountLive = account => Boolean(account.session);
-const expiredAccounts = () => state.accounts.filter(a => !isAccountLive(a));
-const writableCalendars = () => state.calendars.filter(c => c.writable);
+const hasAllScopes = account => (account.scopes || '').split(' ').includes(SCOPE_MANAGE);
+const expiredAccounts = () => state.accounts.filter(a => !isAccountLive(a) || !hasAllScopes(a));
+
+// Google has no calendar order, so it is kept in this browser. Unknown calendars go last.
+function orderedCalendars(calendars) {
+  const rank = cal => {
+    const index = state.order.indexOf(cal.key);
+    return index < 0 ? Infinity : index;
+  };
+  return [...calendars].sort((a, b) => rank(a) - rank(b));
+}
+
+const writableCalendars = () => orderedCalendars(state.calendars).filter(c => c.writable);
 
 function visibleEvents() {
   return state.events.filter(ev => {
@@ -234,7 +249,7 @@ const DEMO_CALENDARS = [
   { key: 'faculdade', name: 'Faculdade', color: '#3b82f6' },
   { key: 'pessoal', name: 'Pessoal', color: '#34a853' },
   { key: 'treino', name: 'Treino', color: '#f59e42' },
-].map(c => ({ ...c, id: c.key, account: null, writable: true, selected: true }));
+].map(c => ({ ...c, id: c.key, account: null, writable: true, selected: true, owner: true, primary: false }));
 
 function demoSeed() {
   const week = startOfWeek(new Date());
@@ -282,6 +297,7 @@ function demoSeed() {
 function demoData() {
   const data = store.get('demo-v2', { week: null, events: [] });
   const week = fmtDateValue(startOfWeek(new Date()));
+  data.calendars ||= DEMO_CALENDARS;
   if (data.week !== week) {
     data.week = week;
     data.events = data.events.filter(e => !e.seed).concat(demoSeed());
@@ -342,10 +358,38 @@ const newDemoId = () => `ev-${Date.now()}-${Math.random().toString(36).slice(2, 
 
 const Demo = {
   async refresh(from, to) {
-    const events = demoData().events
+    const data = demoData();
+    const events = data.events
       .flatMap(e => demoExpand(e, to))
       .filter(e => e.start < to && e.end > from);
-    return { calendars: DEMO_CALENDARS, events, failures: 0 };
+    return { calendars: data.calendars, events, failures: 0 };
+  },
+
+  async listCalendarEvents(calendar, from, to) {
+    return demoData().events
+      .filter(e => e.calendarId === calendar.key)
+      .flatMap(e => demoExpand(e, to))
+      .filter(e => e.start < to && e.end > from);
+  },
+
+  async createCalendar({ name, color }) {
+    const data = demoData();
+    const key = newDemoId();
+    data.calendars.push({ key, id: key, name, color, account: null, writable: true, selected: true, owner: true, primary: false });
+    store.set('demo-v2', data);
+  },
+
+  async updateCalendar(calendar, { name, color }) {
+    const data = demoData();
+    Object.assign(data.calendars.find(c => c.key === calendar.key), { name, color });
+    store.set('demo-v2', data);
+  },
+
+  async deleteCalendar(calendar) {
+    const data = demoData();
+    data.calendars = data.calendars.filter(c => c.key !== calendar.key);
+    data.events = data.events.filter(e => e.calendarId !== calendar.key);
+    store.set('demo-v2', data);
   },
 
   async create(d) {
@@ -528,6 +572,7 @@ function toCalendar(item, email) {
     name: item.summaryOverride || item.summary,
     color: /^#[0-9a-f]{6}$/i.test(item.backgroundColor) ? item.backgroundColor : '#8e8e93',
     writable: item.accessRole === 'owner' || item.accessRole === 'writer',
+    owner: item.accessRole === 'owner',
     selected: Boolean(item.selected),
     primary: Boolean(item.primary),
   };
@@ -545,6 +590,16 @@ function toGoogleTime(date, allDay, patching) {
 
 const eventsPath = calendar => `/calendars/${encodeURIComponent(calendar.id)}/events`;
 const eventPath = (calendar, id) => `${eventsPath(calendar)}/${encodeURIComponent(id)}`;
+const listEntryPath = id => `/users/me/calendarList/${encodeURIComponent(id)}`;
+
+function readableTextColor(hex) {
+  const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+  return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? '#000000' : '#ffffff';
+}
+
+function patchListEntry(account, id, fields) {
+  return googleFetch(account, `${listEntryPath(id)}?colorRgbFormat=true`, { method: 'PATCH', body: JSON.stringify(fields) });
+}
 
 function eventBody(d, patching) {
   return {
@@ -592,6 +647,45 @@ const Google = {
 
     saveAccounts();
     return { calendars: state.accounts.flatMap(a => a.calendars), events, failures };
+  },
+
+  async listCalendarEvents(calendar, from, to) {
+    const items = await googleList(accountOf(calendar), eventsPath(calendar), {
+      timeMin: from.toISOString(),
+      timeMax: to.toISOString(),
+      singleEvents: 'true',
+      orderBy: 'startTime',
+      maxResults: 250,
+    });
+    return items.filter(i => i.status !== 'cancelled').map(i => fromGoogle(i, calendar));
+  },
+
+  async createCalendar({ email, name, color }) {
+    const account = state.accounts.find(a => a.email === email);
+    const created = await googleFetch(account, '/calendars', {
+      method: 'POST',
+      body: JSON.stringify({ summary: name, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
+    });
+    await patchListEntry(account, created.id, { backgroundColor: color, foregroundColor: readableTextColor(color), selected: true });
+  },
+
+  // Only secondary calendars you own can be renamed. Others keep a private name in your list.
+  async updateCalendar(calendar, { name, color }) {
+    const account = accountOf(calendar);
+    const renamesOriginal = calendar.owner && !calendar.primary;
+    if (renamesOriginal && name !== calendar.name) {
+      await googleFetch(account, `/calendars/${encodeURIComponent(calendar.id)}`, { method: 'PATCH', body: JSON.stringify({ summary: name }) });
+    }
+    await patchListEntry(account, calendar.id, {
+      backgroundColor: color,
+      foregroundColor: readableTextColor(color),
+      summaryOverride: renamesOriginal ? null : name,
+    });
+  },
+
+  async deleteCalendar(calendar) {
+    const path = calendar.owner ? `/calendars/${encodeURIComponent(calendar.id)}` : listEntryPath(calendar.id);
+    await googleFetch(accountOf(calendar), path, { method: 'DELETE' });
   },
 
   async create(d) {
@@ -710,7 +804,7 @@ function requestCode(loginHint) {
         const granted = (response.scope || '').split(' ');
         if (response.error) reject(new Error(`O Google recusou o acesso (${response.error}).`));
         else if (response.state !== expectedState) reject(new Error('A resposta do Google não é válida. Tenta de novo.'));
-        else if (!granted.includes(SCOPE_EVENTS) || !granted.includes(SCOPE_CALENDARS)) {
+        else if (![SCOPE_EVENTS, SCOPE_CALENDARS, SCOPE_MANAGE].every(s => granted.includes(s))) {
           reject(new Error('Falta dar acesso ao calendário. Tenta de novo e marca todas as permissões.'));
         } else resolve(response.code);
       },
@@ -731,7 +825,7 @@ async function connectAccount(loginHint) {
     const res = await authPost('/auth/exchange', { code });
     if (res.status === 409) throw new Error('O Google precisa de confirmar as permissões. Liga a conta mais uma vez.');
     if (!res.ok) throw new Error('Não foi possível ligar a conta. Tenta de novo.');
-    const { email, session, access_token: token, expires_in: expiresIn } = await res.json();
+    const { email, session, scope, access_token: token, expires_in: expiresIn } = await res.json();
 
     let account = state.accounts.find(a => a.email === email);
     if (!account) {
@@ -739,6 +833,7 @@ async function connectAccount(loginHint) {
       state.accounts.push(account);
     }
     account.session = session;
+    account.scopes = scope;
     accessTokens.set(email, { token, expiresAt: Date.now() + expiresIn * 1000 });
     saveAccounts();
     await refresh();
@@ -809,6 +904,7 @@ async function refresh() {
     state.syncFailed = true;
   }
   render();
+  if (panel.calendarKey) loadCalendarPanel();
 }
 
 /* Navigation */
@@ -880,7 +976,8 @@ function renderSession() {
   const expired = expiredAccounts();
   const button = $('reauth');
   button.hidden = !expired.length;
-  button.textContent = `Sessão expirada · reativar${expired.length > 1 ? ` (${expired.length})` : ''}`;
+  const label = expired.every(isAccountLive) ? 'Novas permissões' : 'Sessão expirada';
+  button.textContent = `${label} · reativar${expired.length > 1 ? ` (${expired.length})` : ''}`;
   button.title = expired.map(a => a.email).join(', ');
 }
 
@@ -919,22 +1016,12 @@ function renderSidebar() {
     ? [{ name: null, calendars: state.calendars }]
     : state.accounts.map(a => ({ name: a.email, calendars: a.calendars }));
 
-  $('calendar-list').replaceChildren(...groups.map(group => h('div', { class: 'cal-group' },
-    group.name && h('div', { class: 'cal-group-name' }, group.name),
-    group.calendars.map(cal => h('label', { class: 'cal-row', '--c': cal.color },
-      h('input', {
-        type: 'checkbox',
-        checked: isVisible(cal),
-        onchange: e => {
-          state.visibility[cal.key] = e.target.checked;
-          store.set('visibility', state.visibility);
-          closePopover();
-          renderView();
-        },
-      }),
-      h('span', {}, cal.name),
-    )),
-  )));
+  if (!calendarDragActive) {
+    $('calendar-list').replaceChildren(...groups.map(group => h('div', { class: 'cal-group' },
+      group.name && h('div', { class: 'cal-group-name' }, group.name),
+      orderedCalendars(group.calendars).map(calendarRow),
+    )));
+  }
 
   $('account-section').hidden = IS_DEMO;
   $('demo-note').hidden = !IS_DEMO;
@@ -944,9 +1031,313 @@ function renderSidebar() {
   )));
 }
 
+function calendarRow(cal) {
+  const isOpen = panel.calendarKey === cal.key;
+  return h('div', {
+    class: isOpen ? 'cal-row is-open' : 'cal-row',
+    'data-key': cal.key,
+    '--c': cal.color,
+    onpointerdown: startCalendarDrag,
+    onkeydown: moveCalendarWithKeys,
+  },
+    h('span', { class: 'cal-grip', title: 'Arrastar para reorganizar', 'aria-hidden': 'true' }),
+    h('input', {
+      type: 'checkbox',
+      'aria-label': `Mostrar ${cal.name}`,
+      checked: isVisible(cal),
+      onchange: e => {
+        state.visibility[cal.key] = e.target.checked;
+        store.set('visibility', state.visibility);
+        closePopover();
+        renderView();
+      },
+    }),
+    h('button', { class: 'cal-name', type: 'button', title: `Ver eventos de ${cal.name}`, onclick: () => toggleCalendarPanel(cal) }, cal.name),
+    h('button', { class: 'cal-more', type: 'button', 'aria-label': `Editar ${cal.name}`, title: 'Editar calendário', onclick: () => openCalendarEditor(cal) }, '⋯'),
+  );
+}
+
+function saveCalendarOrder() {
+  state.order = [...$('calendar-list').querySelectorAll('.cal-row')].map(row => row.dataset.key);
+  store.set('calendarOrder', state.order);
+}
+
+let calendarDragActive = false;
+
+function startCalendarDrag(e) {
+  const row = e.currentTarget;
+  const onGrip = e.target.closest('.cal-grip');
+  if (e.button !== 0 || e.target.closest('input, .cal-more') || (e.pointerType === 'touch' && !onGrip)) return;
+
+  const startY = e.clientY;
+  const list = row.parentElement;
+
+  const move = ev => {
+    if (!calendarDragActive) {
+      if (Math.abs(ev.clientY - startY) < 5) return;
+      calendarDragActive = true;
+      row.classList.add('is-dragging');
+    }
+    const others = [...list.querySelectorAll('.cal-row')].filter(r => r !== row);
+    const next = others.find(r => {
+      const box = r.getBoundingClientRect();
+      return ev.clientY < box.top + box.height / 2;
+    });
+    list.insertBefore(row, next || null);
+  };
+
+  const finish = () => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', finish);
+    document.removeEventListener('pointercancel', finish);
+    if (!calendarDragActive) return;
+
+    calendarDragActive = false;
+    row.classList.remove('is-dragging');
+    saveCalendarOrder();
+
+    // The click that ends a drag must not open the calendar's panel.
+    const swallow = ev => ev.stopPropagation();
+    document.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 0);
+  };
+
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', finish);
+  document.addEventListener('pointercancel', finish);
+}
+
+function moveCalendarWithKeys(e) {
+  if (!e.altKey || !['ArrowUp', 'ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const row = e.currentTarget;
+  const focused = document.activeElement;
+  if (e.key === 'ArrowUp' && row.previousElementSibling?.matches('.cal-row')) row.previousElementSibling.before(row);
+  if (e.key === 'ArrowDown' && row.nextElementSibling) row.nextElementSibling.after(row);
+  focused.focus();
+  saveCalendarOrder();
+}
+
 function renderView() {
   if (state.view === 'month') renderMonth();
   else renderTimeView(viewDays());
+}
+
+/* Calendar panel */
+
+const panel = {
+  calendarKey: null,
+  days: PANEL_DAYS,
+  events: [],
+  loading: false,
+  failed: false,
+  run: 0,
+};
+
+function toggleCalendarPanel(cal) {
+  if (panel.calendarKey === cal.key) {
+    closeCalendarPanel();
+    return;
+  }
+  closePopover();
+  closeDrawer();
+  Object.assign(panel, { calendarKey: cal.key, days: PANEL_DAYS, events: [], failed: false });
+  renderSidebar();
+  loadCalendarPanel();
+}
+
+function closeCalendarPanel() {
+  panel.calendarKey = null;
+  panel.run++;
+  $('cal-panel').hidden = true;
+  renderSidebar();
+}
+
+async function loadCalendarPanel() {
+  const calendar = calendarByKey(panel.calendarKey);
+  if (!calendar) {
+    closeCalendarPanel();
+    return;
+  }
+  const run = ++panel.run;
+  const from = startOfDay(new Date());
+  panel.loading = true;
+  renderCalendarPanel();
+  try {
+    const events = await backend.listCalendarEvents(calendar, from, addDays(from, panel.days));
+    if (run !== panel.run) return;
+    panel.events = events.sort((a, b) => a.start - b.start);
+    panel.failed = false;
+  } catch (err) {
+    if (run !== panel.run) return;
+    panel.failed = true;
+  }
+  panel.loading = false;
+  renderCalendarPanel();
+}
+
+function panelDays() {
+  const today = startOfDay(new Date());
+  const days = new Map();
+  for (const ev of panel.events) {
+    const day = ev.start < today ? today : startOfDay(ev.start);
+    const key = fmtDateValue(day);
+    if (!days.has(key)) days.set(key, { day, events: [] });
+    days.get(key).events.push(ev);
+  }
+  return [...days.values()];
+}
+
+function panelEvent(ev) {
+  return h('button', { class: 'panel-ev', type: 'button', onclick: e => openPopover(ev, e.currentTarget) },
+    h('time', {}, inAllDayRow(ev) ? 'Dia todo' : fmtTime(ev.start)),
+    h('span', {}, titleOf(ev)),
+  );
+}
+
+function renderCalendarPanel() {
+  const calendar = calendarByKey(panel.calendarKey);
+  const element = $('cal-panel');
+  if (!calendar) return;
+
+  const count = panel.events.length;
+  const summary = `${count} ${count === 1 ? 'evento' : 'eventos'} nos próximos ${panel.days} dias`;
+  let body;
+  if (panel.failed) body = h('p', { class: 'panel-note' }, 'Não foi possível carregar os eventos. Tenta de novo.');
+  else if (panel.loading && !count) body = h('p', { class: 'panel-note' }, 'A carregar...');
+  else if (!count) body = h('p', { class: 'panel-note' }, `Sem eventos nos próximos ${panel.days} dias.`);
+  else {
+    body = panelDays().map(({ day, events }) => h('section', { class: 'panel-day' },
+      h('button', { class: 'panel-date', type: 'button', onclick: () => goTo(day, 'day') }, fmtLong(day)),
+      events.map(panelEvent),
+    ));
+  }
+
+  element.replaceChildren(
+    h('header', { class: 'panel-head', '--c': calendar.color },
+      h('i', {}),
+      h('h2', {}, calendar.name),
+      h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Fechar', onclick: closeCalendarPanel }, '×'),
+    ),
+    h('p', { class: 'panel-summary' }, summary),
+    h('div', { class: 'panel-list' }, body),
+    !panel.failed && !panel.loading && h('button', {
+      class: 'btn btn-block',
+      type: 'button',
+      onclick: () => {
+        panel.days += PANEL_DAYS;
+        loadCalendarPanel();
+      },
+    }, 'Mostrar mais'),
+  );
+  element.hidden = false;
+}
+
+/* Calendar editor */
+
+const calendarEditor = {
+  calendar: null,
+  color: CALENDAR_COLORS[6],
+};
+
+function setCalendarColor(color) {
+  calendarEditor.color = color;
+  $('cal-color').value = color;
+  for (const swatch of $('cal-swatches').children) {
+    swatch.setAttribute('aria-pressed', String(swatch.dataset.color === color));
+  }
+}
+
+function showCalendarError(message) {
+  const el = $('cal-error');
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+function openCalendarEditor(calendar) {
+  if (!IS_DEMO && !state.accounts.length) {
+    toast('Adiciona uma conta Google para criar calendários.');
+    return;
+  }
+  closePopover();
+  closeDrawer();
+  calendarEditor.calendar = calendar || null;
+
+  const isAlias = calendar && (!calendar.owner || calendar.primary);
+  $('cal-editor-title').textContent = calendar ? 'Editar calendário' : 'Novo calendário';
+  $('cal-name').value = calendar?.name || '';
+  $('cal-note').hidden = !isAlias;
+  $('cal-account-row').hidden = IS_DEMO || Boolean(calendar) || state.accounts.length < 2;
+  $('cal-account').replaceChildren(...state.accounts.map(a => h('option', { value: a.email }, a.email)));
+  $('cal-delete').hidden = !calendar || calendar.primary;
+  $('cal-delete').textContent = calendar?.owner ? 'Apagar calendário' : 'Remover da lista';
+  $('cal-confirm').hidden = true;
+  $('cal-save-actions').hidden = false;
+  setCalendarColor(calendar?.color || CALENDAR_COLORS[6]);
+  showCalendarError('');
+
+  $('cal-editor').showModal();
+  $('cal-name').focus();
+}
+
+async function saveCalendar(e) {
+  e.preventDefault();
+  const name = $('cal-name').value.trim();
+  if (!name) {
+    showCalendarError('Indica um nome para o calendário.');
+    return;
+  }
+
+  const button = $('cal-save');
+  const { calendar, color } = calendarEditor;
+  button.disabled = true;
+  try {
+    if (calendar) await backend.updateCalendar(calendar, { name, color });
+    else await backend.createCalendar({ email: $('cal-account').value || state.accounts[0]?.email, name, color });
+    $('cal-editor').close();
+    await refresh();
+  } catch (err) {
+    showCalendarError(err.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function askCalendarDelete() {
+  const { calendar } = calendarEditor;
+  $('cal-save-actions').hidden = true;
+  $('cal-confirm').hidden = false;
+  $('cal-confirm-row').hidden = !calendar.owner;
+  $('cal-confirm-name').value = '';
+  $('cal-confirm-text').textContent = calendar.owner
+    ? `Isto apaga "${calendar.name}" e todos os seus eventos para sempre. Escreve o nome do calendário para confirmar.`
+    : `Remover "${calendar.name}" da tua lista? O calendário continua a existir.`;
+  $('cal-confirm-delete').textContent = calendar.owner ? 'Apagar para sempre' : 'Remover';
+  updateCalendarConfirm();
+  if (calendar.owner) $('cal-confirm-name').focus();
+}
+
+function updateCalendarConfirm() {
+  const { calendar } = calendarEditor;
+  $('cal-confirm-delete').disabled = calendar.owner && $('cal-confirm-name').value.trim() !== calendar.name;
+}
+
+async function deleteCalendar() {
+  const { calendar } = calendarEditor;
+  const button = $('cal-confirm-delete');
+  button.disabled = true;
+  try {
+    await backend.deleteCalendar(calendar);
+    delete state.visibility[calendar.key];
+    store.set('visibility', state.visibility);
+    state.order = state.order.filter(key => key !== calendar.key);
+    store.set('calendarOrder', state.order);
+    $('cal-editor').close();
+    await refresh();
+  } catch (err) {
+    showCalendarError(err.message);
+    updateCalendarConfirm();
+  }
 }
 
 /* Week and day view */
@@ -1382,7 +1773,7 @@ function fillCalendarSelect(selectedKey) {
   } else {
     select.replaceChildren(...state.accounts
       .filter(a => a.calendars.some(c => c.writable))
-      .map(a => h('optgroup', { label: a.email }, a.calendars.filter(c => c.writable).map(option))));
+      .map(a => h('optgroup', { label: a.email }, writable.filter(c => c.account === a.email).map(option))));
   }
   select.value = selectedKey;
 }
@@ -1688,6 +2079,23 @@ function bindEvents() {
   $('mini-prev').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, -1); renderMini(); });
   $('mini-next').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, 1); renderMini(); });
 
+  $('new-calendar').addEventListener('click', () => openCalendarEditor(null));
+  $('cal-form').addEventListener('submit', saveCalendar);
+  $('cal-cancel').addEventListener('click', () => $('cal-editor').close());
+  $('cal-delete').addEventListener('click', askCalendarDelete);
+  $('cal-confirm-cancel').addEventListener('click', () => {
+    $('cal-confirm').hidden = true;
+    $('cal-save-actions').hidden = false;
+  });
+  $('cal-name').addEventListener('input', () => showCalendarError(''));
+  $('cal-confirm-name').addEventListener('input', updateCalendarConfirm);
+  $('cal-confirm-delete').addEventListener('click', deleteCalendar);
+  $('cal-color').addEventListener('input', e => setCalendarColor(e.target.value));
+  $('cal-swatches').addEventListener('click', e => {
+    const swatch = e.target.closest('button');
+    if (swatch) setCalendarColor(swatch.dataset.color);
+  });
+
   $('editor-form').addEventListener('submit', saveEditor);
   $('ed-cancel').addEventListener('click', () => $('editor').close());
   $('ed-allday').addEventListener('change', () => { toggleAllDay(); rememberDuration(); });
@@ -1765,13 +2173,14 @@ function onKeydown(e) {
       cancelDrag();
       if (renderPending) render();
     }
-    closePopover();
+    if (!$('popover').hidden) closePopover();
+    else if (panel.calendarKey && !$('cal-editor').open) closeCalendarPanel();
     closeDrawer();
     return;
   }
 
   const typing = e.target.closest?.('input:not([type="checkbox"]), textarea, select, [contenteditable]');
-  if (typing || e.ctrlKey || e.metaKey || e.altKey || $('editor').open) return;
+  if (typing || e.ctrlKey || e.metaKey || e.altKey || $('editor').open || $('cal-editor').open) return;
 
   const actions = {
     arrowleft: () => step(-1),
@@ -1812,6 +2221,7 @@ function start() {
   if (store.get('sidebarHidden', false)) document.body.classList.add('sidebar-hidden');
   $('time-options').append(...Array.from({ length: 48 }, (_, i) => h('option', { value: `${pad(Math.floor(i / 2))}:${pad((i % 2) * 30)}` })));
   $('ed-weekdays').append(...RRULE_DAYS.map((day, i) => h('button', { type: 'button', 'data-day': day, 'aria-pressed': 'false', 'aria-label': DAYS[i] }, DAYS_MINI[i])));
+  $('cal-swatches').append(...CALENDAR_COLORS.map(color => h('button', { type: 'button', 'data-color': color, 'aria-label': `Cor ${color}`, '--c': color })));
 
   bindEvents();
   if (!IS_DEMO) {

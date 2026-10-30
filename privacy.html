@@ -17,7 +17,7 @@
     <h2>Dados a que o Chronos acede</h2>
     <ul>
       <li>O endereço de email da tua conta Google, para identificar a conta.</li>
-      <li>A lista dos teus calendários.</li>
+      <li>Os teus calendários e as suas propriedades, para os mostrar, criar, alterar e apagar a teu pedido.</li>
       <li>Os eventos dos teus calendários, para os mostrar, criar, alterar, mover e apagar a teu pedido.</li>
     </ul>
 
@@ -25,6 +25,8 @@
     <p>Os eventos são pedidos diretamente pelo teu browser ao Google e não passam por nenhum servidor do Chronos. Não são guardados pelo Chronos.</p>
     <p>No teu browser ficam guardados o teu email, a lista de calendários, as tuas preferências e uma chave de sessão cifrada.</p>
     <p>Um pequeno serviço do Chronos no Cloudflare Workers renova o acesso ao Google. Recebe essa chave de sessão apenas para pedir um novo acesso e não guarda nenhum dado. A sessão termina ao fim de 90 dias sem uso.</p>
+
+    <p>A ordem dos calendários fica guardada apenas no teu browser.</p>
 
     <h2>Partilha de dados</h2>
     <p>O Chronos não vende, não partilha e não usa os teus dados para publicidade. Não usa ferramentas de análise nem cookies de rastreio.</p>

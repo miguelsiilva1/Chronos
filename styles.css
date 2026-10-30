@@ -176,6 +176,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 }
 
 .btn:hover { background: var(--bg-hover); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
 .btn-block { width: 100%; }
 .btn-danger { color: var(--accent); }
 
@@ -292,19 +293,61 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
   white-space: nowrap;
 }
 
+.side-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-1); }
+.side-head h2 { margin-bottom: 0; }
+
 .cal-row {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  padding: 4px var(--space-1);
+  gap: var(--space-1);
+  padding: 2px var(--space-1) 2px 0;
   border-radius: var(--radius-m);
   font-size: var(--fs-m);
-  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
   transition: background var(--speed);
 }
 
-.cal-row:hover { background: var(--bg-hover); }
-.cal-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cal-row:hover, .cal-row.is-open { background: var(--bg-hover); }
+.cal-row.is-dragging { background: var(--band); opacity: .85; cursor: grabbing; }
+
+.cal-grip {
+  flex: none;
+  width: 10px;
+  height: 16px;
+  background-image: radial-gradient(var(--text-3) 1px, transparent 1.2px);
+  background-size: 4px 4px;
+  background-position: center;
+  opacity: 0;
+  cursor: grab;
+  touch-action: none;
+  transition: opacity var(--speed);
+}
+
+.cal-row:hover .cal-grip { opacity: 1; }
+
+.cal-name {
+  flex: 1;
+  min-width: 0;
+  padding: 2px var(--space-1);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cal-more {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-s);
+  color: var(--text-2);
+  opacity: 0;
+  transition: opacity var(--speed), background var(--speed);
+}
+
+.cal-row:hover .cal-more, .cal-more:focus-visible { opacity: 1; }
+.cal-more:hover { background: var(--line-2); }
 
 .cal-row input {
   flex: none;
@@ -339,6 +382,58 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 
 .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-3); }
 .side-foot p { font-size: var(--fs-s); line-height: 1.5; color: var(--text-2); }
+
+/* Calendar panel */
+
+.cal-panel {
+  flex: none;
+  width: 272px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.panel-head { display: flex; align-items: center; gap: var(--space-2); }
+.panel-head i { flex: none; width: 10px; height: 10px; border-radius: var(--radius-full); background: var(--c); }
+.panel-head h2 { flex: 1; min-width: 0; font-size: var(--fs-l); font-weight: 600; overflow-wrap: anywhere; }
+.panel-head .icon-btn { font-size: var(--fs-l); }
+
+.panel-summary, .panel-note { font-size: var(--fs-s); color: var(--text-3); }
+
+.panel-list { flex: 1; min-height: 0; overflow-y: auto; }
+.panel-day + .panel-day { margin-top: var(--space-3); }
+
+.panel-date {
+  display: block;
+  width: 100%;
+  padding: 2px 0;
+  font-size: var(--fs-s);
+  font-weight: 600;
+  color: var(--text-2);
+  text-align: left;
+  transition: color var(--speed);
+}
+
+.panel-date:hover { color: var(--text); }
+
+.panel-ev {
+  display: flex;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 3px var(--space-1);
+  border-radius: var(--radius-s);
+  font-size: var(--fs-m);
+  text-align: left;
+  transition: background var(--speed);
+}
+
+.panel-ev:hover { background: var(--bg-hover); }
+.panel-ev time { flex: none; width: 52px; font-size: var(--fs-s); line-height: 1.55; color: var(--text-3); }
+.panel-ev span { min-width: 0; overflow-wrap: anywhere; }
 
 /* Week and day */
 
@@ -734,6 +829,37 @@ textarea.input { resize: vertical; }
 
 .editor-error { margin-top: var(--space-2); font-size: var(--fs-m); color: var(--accent); font-weight: 500; }
 
+.field-label { flex: none; width: 80px; font-size: var(--fs-m); color: var(--text-2); }
+.editor-note { margin: 0 0 var(--space-2) 88px; font-size: var(--fs-s); color: var(--text-3); }
+
+.swatches { flex: 1; display: grid; grid-template-columns: repeat(6, 28px); gap: var(--space-1); }
+
+.swatches button {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  background: var(--c);
+  transition: opacity var(--speed);
+}
+
+.swatches button:hover { opacity: .8; }
+.swatches button[aria-pressed="true"] { outline: 2px solid var(--text); outline-offset: 2px; }
+
+.color-input {
+  flex: none;
+  align-self: flex-start;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-s);
+  background: none;
+  cursor: pointer;
+}
+
+.cal-confirm { margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--line); font-size: var(--fs-m); }
+.cal-confirm p { margin-bottom: var(--space-2); }
+
 .weekdays { display: flex; gap: var(--space-1); margin: 0 0 var(--space-2) 88px; }
 
 .weekdays button {
@@ -800,6 +926,16 @@ textarea.input { resize: vertical; }
 
   .drawer-open .sidebar { display: flex; }
 
+  .cal-panel {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 16;
+    width: min(320px, 90vw);
+    box-shadow: var(--shadow);
+  }
+
+  .cal-grip, .cal-more { opacity: 1; }
+
   .drawer-open .scrim {
     display: block;
     position: fixed;
@@ -847,9 +983,11 @@ textarea.input { resize: vertical; }
 
   .editor { padding: var(--space-4); }
   .check { margin-left: 0; }
-  .field-row label { width: 68px; }
+  .field-row label, .field-label { width: 68px; }
   .input-time { width: 76px; }
-  .weekdays { margin-left: 0; }
+  .weekdays, .editor-note { margin-left: 0; }
+  .swatches { grid-template-columns: repeat(6, 24px); }
+  .swatches button { width: 24px; height: 24px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

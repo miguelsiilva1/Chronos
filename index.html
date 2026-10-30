@@ -30,7 +30,12 @@
       </section>
 
       <section class="side-section">
-        <h2>Calendários</h2>
+        <div class="side-head">
+          <h2>Calendários</h2>
+          <button class="icon-btn" id="new-calendar" type="button" aria-label="Novo calendário" title="Novo calendário">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+          </button>
+        </div>
         <div id="calendar-list"></div>
       </section>
 
@@ -47,6 +52,7 @@
       </div>
     </aside>
     <div class="scrim" id="scrim"></div>
+    <aside class="cal-panel" id="cal-panel" aria-label="Eventos do calendário" hidden></aside>
 
     <main class="main">
       <header class="topbar">
@@ -156,6 +162,46 @@
       <div class="editor-actions">
         <button class="btn" id="ed-cancel" type="button">Cancelar</button>
         <button class="btn btn-primary" id="ed-save" type="submit">Guardar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="editor" id="cal-editor" aria-labelledby="cal-editor-title">
+    <form id="cal-form" novalidate>
+      <h2 id="cal-editor-title">Novo calendário</h2>
+      <div class="field-row" id="cal-account-row">
+        <label for="cal-account">Conta</label>
+        <select class="input" id="cal-account"></select>
+      </div>
+      <div class="field-row">
+        <label for="cal-name">Nome</label>
+        <input class="input" id="cal-name" type="text" maxlength="200" autocomplete="off">
+      </div>
+      <p class="editor-note" id="cal-note" hidden>Este nome só muda na tua lista.</p>
+      <div class="field-row">
+        <span class="field-label">Cor</span>
+        <div class="swatches" id="cal-swatches"></div>
+        <input class="color-input" id="cal-color" type="color" aria-label="Cor personalizada" title="Cor personalizada">
+      </div>
+
+      <p class="editor-error" id="cal-error" role="alert" hidden></p>
+
+      <div class="editor-actions" id="cal-save-actions">
+        <button class="btn btn-danger" id="cal-delete" type="button" hidden>Apagar calendário</button>
+        <span class="topbar-gap"></span>
+        <button class="btn" id="cal-cancel" type="button">Cancelar</button>
+        <button class="btn btn-primary" id="cal-save" type="submit">Guardar</button>
+      </div>
+
+      <div class="cal-confirm" id="cal-confirm" hidden>
+        <p id="cal-confirm-text"></p>
+        <div id="cal-confirm-row">
+          <input class="input" id="cal-confirm-name" type="text" aria-label="Nome do calendário" autocomplete="off">
+        </div>
+        <div class="editor-actions">
+          <button class="btn" id="cal-confirm-cancel" type="button">Voltar</button>
+          <button class="btn btn-danger" id="cal-confirm-delete" type="button">Apagar para sempre</button>
+        </div>
       </div>
     </form>
   </dialog>
