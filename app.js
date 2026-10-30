@@ -9,6 +9,7 @@ const GIS_URL = 'https://accounts.google.com/gsi/client';
 const SCOPE_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
 const SCOPE_CALENDARS = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
 const SCOPES = [SCOPE_EVENTS, SCOPE_CALENDARS, 'openid', 'email'].join(' ');
+const GOOGLE_LINK_HOSTS = ['www.google.com', 'calendar.google.com'];
 
 const SYNC_INTERVAL = 5 * 60 * 1000;
 const FOCUS_THROTTLE = 10 * 1000;
@@ -23,6 +24,9 @@ const MONTHS_SHORT = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 's
 const DAYS = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo'];
 const DAYS_SHORT = ['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'];
 const DAYS_MINI = ['S', 'T', 'Q', 'Q', 'S', 'S', 'D'];
+const RRULE_DAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
+const RRULE_FREQS = ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'];
+const MAX_OCCURRENCES = 2000;
 
 const $ = id => document.getElementById(id);
 
@@ -65,6 +69,85 @@ function parseTime(value) {
   const minutes = Number(match[2] || 0);
   return hours < 24 && minutes < 60 ? hours * 60 + minutes : null;
 }
+
+/* Recurrence */
+
+const isRRule = line => line.startsWith('RRULE:');
+const compactDate = d => fmtDateValue(d).replaceAll('-', '');
+const compactUtc = d => `${d.toISOString().slice(0, 19).replace(/[-:]/g, '')}Z`;
+
+function parseUntil(value) {
+  const [, y, m, d, time] = value.match(/^(\d{4})(\d{2})(\d{2})(T\d{6}Z)?$/) || [];
+  if (!y) return null;
+  if (!time) return new Date(y, m - 1, d, 23, 59, 59);
+  return new Date(`${y}-${m}-${d}T${time.slice(1, 3)}:${time.slice(3, 5)}:${time.slice(5, 7)}Z`);
+}
+
+// Returns null for rules the editor cannot show, such as "second Tuesday of the month".
+function parseRule(line) {
+  const fields = Object.fromEntries(line.replace(/^RRULE:/, '').split(';').map(part => part.split('=')));
+  const { FREQ, INTERVAL, BYDAY, COUNT, UNTIL, WKST, ...others } = fields;
+  const byDay = BYDAY ? BYDAY.split(',') : null;
+  const until = UNTIL ? parseUntil(UNTIL) : null;
+  const plainDays = !byDay || (FREQ === 'WEEKLY' && byDay.every(d => RRULE_DAYS.includes(d)));
+  if (!RRULE_FREQS.includes(FREQ) || !plainDays || Object.keys(others).length || (UNTIL && !until)) return null;
+  return { freq: FREQ, interval: Number(INTERVAL || 1), byDay, count: COUNT ? Number(COUNT) : null, until };
+}
+
+function formatRule(rule, allDay) {
+  const parts = [`FREQ=${rule.freq}`];
+  if (rule.interval > 1) parts.push(`INTERVAL=${rule.interval}`);
+  if (rule.byDay) parts.push(`BYDAY=${rule.byDay.join(',')}`);
+  if (rule.count) parts.push(`COUNT=${rule.count}`);
+  if (rule.until) parts.push(`UNTIL=${allDay ? compactDate(rule.until) : compactUtc(rule.until)}`);
+  return `RRULE:${parts.join(';')}`;
+}
+
+// Ends a rule just before an occurrence. Used to split a series in two.
+function endRuleBefore(line, ev) {
+  const start = ev.originalStart || ev.start;
+  const kept = line.split(';').filter(part => !/^(COUNT|UNTIL)=/.test(part)).join(';');
+  return `${kept};UNTIL=${ev.allDay ? compactDate(addDays(start, -1)) : compactUtc(new Date(start.getTime() - 1000))}`;
+}
+
+// Yields each start of a rule the demo calendar uses, up to `limit`.
+function* occurrences(rule, start, limit) {
+  const time = minutesOf(start);
+  const days = rule.byDay ? rule.byDay.map(d => RRULE_DAYS.indexOf(d)).sort((a, b) => a - b) : [weekdayIndex(start)];
+  let produced = 0;
+
+  const candidates = function* () {
+    for (let n = 0; n < MAX_OCCURRENCES; n++) {
+      const step = n * rule.interval;
+      if (rule.freq === 'DAILY') yield addDays(start, step);
+      else if (rule.freq === 'WEEKLY') for (const d of days) yield addDays(startOfWeek(start), step * 7 + d);
+      else {
+        const months = rule.freq === 'MONTHLY' ? step : step * 12;
+        const day = new Date(start.getFullYear(), start.getMonth() + months, start.getDate());
+        if (day.getDate() === start.getDate()) yield day;
+      }
+    }
+  };
+
+  for (const candidate of candidates()) {
+    const occurrence = atMinutes(candidate, time);
+    if (occurrence < start) continue;
+    if (occurrence >= limit || (rule.until && occurrence > rule.until) || (rule.count && produced >= rule.count)) return;
+    produced++;
+    yield occurrence;
+  }
+}
+
+// Applies an edit made on one occurrence to the whole series.
+function shiftSeries(series, ev, d) {
+  const shift = dayDiff(ev.originalStart || ev.start, d.start);
+  const day = addDays(series.start, shift);
+  const start = d.allDay ? startOfDay(day) : atMinutes(day, minutesOf(d.start));
+  const end = d.allDay ? addDays(start, dayDiff(d.start, d.end)) : new Date(start.getTime() + (d.end - d.start));
+  return { ...d, start, end };
+}
+
+const isFirstOccurrence = (ev, series) => (ev.originalStart || ev.start).getTime() === series.start.getTime();
 
 /* Storage */
 
@@ -163,7 +246,8 @@ function demoSeed() {
     end: atMinutes(addDays(week, day), endMin).toISOString(),
     location: '',
     notes: '',
-    recurring: false,
+    recurrence: [],
+    exceptions: [],
     seed: true,
     ...extra,
   });
@@ -172,16 +256,13 @@ function demoSeed() {
     end: addDays(week, day + length).toISOString(),
   });
 
-  for (let w = -3; w <= 3; w++) {
-    const day = n => w * 7 + n;
-    const weekly = { recurring: true };
-    add('faculdade', 'Aula teórica', day(0), 540, 660, { ...weekly, location: 'Sala B201' });
-    add('faculdade', 'Aula teórica', day(3), 540, 660, { ...weekly, location: 'Sala B201' });
-    add('faculdade', 'Aula prática', day(1), 840, 960, { ...weekly, location: 'Laboratório 3' });
-    add('treino', 'Ginásio', day(0), 1140, 1230, weekly);
-    add('treino', 'Ginásio', day(2), 1140, 1230, weekly);
-    add('treino', 'Ginásio', day(4), 1080, 1170, weekly);
-  }
+  const weekly = { recurrence: ['RRULE:FREQ=WEEKLY'] };
+  add('faculdade', 'Aula teórica', -21, 540, 660, { ...weekly, location: 'Sala B201' });
+  add('faculdade', 'Aula teórica', -18, 540, 660, { ...weekly, location: 'Sala B201' });
+  add('faculdade', 'Aula prática', -20, 840, 960, { ...weekly, location: 'Laboratório 3' });
+  add('treino', 'Ginásio', -21, 1140, 1230, weekly);
+  add('treino', 'Ginásio', -19, 1140, 1230, weekly);
+  add('treino', 'Ginásio', -17, 1080, 1170, weekly);
 
   add('pessoal', 'Dentista', 1, 600, 645, { location: 'Clínica da Baixa' });
   add('faculdade', 'Reunião de grupo', 2, 1080, 1140, { notes: 'Rever a apresentação e dividir tarefas.' });
@@ -197,12 +278,12 @@ function demoSeed() {
 }
 
 function demoData() {
-  const data = store.get('demo', { week: null, events: [] });
+  const data = store.get('demo-v2', { week: null, events: [] });
   const week = fmtDateValue(startOfWeek(new Date()));
   if (data.week !== week) {
     data.week = week;
     data.events = data.events.filter(e => !e.seed).concat(demoSeed());
-    store.set('demo', data);
+    store.set('demo-v2', data);
   }
   return data;
 }
@@ -216,46 +297,101 @@ function demoFields(d) {
     end: d.end.toISOString(),
     location: d.location,
     notes: d.notes,
+    recurrence: d.recurrence || [],
+    seed: false,
   };
 }
+
+function demoEvent(stored, start, end) {
+  const recurring = stored.recurrence.length > 0;
+  const key = recurring ? `${stored.id}@${fmtDateValue(start)}` : stored.id;
+  return {
+    key,
+    id: key,
+    storedId: stored.id,
+    recurringId: recurring ? stored.id : null,
+    originalStart: recurring ? start : null,
+    calendarKey: stored.calendarId,
+    title: stored.title,
+    allDay: stored.allDay,
+    start,
+    end,
+    location: stored.location,
+    notes: stored.notes,
+    recurring,
+    link: null,
+  };
+}
+
+function demoExpand(stored, to) {
+  const start = new Date(stored.start);
+  const end = new Date(stored.end);
+  const [line] = stored.recurrence.filter(isRRule);
+  if (!line) return [demoEvent(stored, start, end)];
+
+  const days = dayDiff(start, end);
+  const duration = end - start;
+  return [...occurrences(parseRule(line), start, to)]
+    .filter(s => !stored.exceptions.includes(fmtDateValue(s)))
+    .map(s => demoEvent(stored, s, stored.allDay ? addDays(s, days) : new Date(s.getTime() + duration)));
+}
+
+const newDemoId = () => `ev-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 const Demo = {
   async refresh(from, to) {
     const events = demoData().events
-      .map(e => ({
-        key: e.id,
-        id: e.id,
-        calendarKey: e.calendarId,
-        title: e.title,
-        allDay: e.allDay,
-        start: new Date(e.start),
-        end: new Date(e.end),
-        location: e.location,
-        notes: e.notes,
-        recurring: e.recurring,
-        link: null,
-      }))
+      .flatMap(e => demoExpand(e, to))
       .filter(e => e.start < to && e.end > from);
     return { calendars: DEMO_CALENDARS, events, failures: 0 };
   },
 
   async create(d) {
     const data = demoData();
-    data.events.push({ id: `ev-${Date.now()}`, recurring: false, ...demoFields(d) });
-    store.set('demo', data);
+    data.events.push({ id: newDemoId(), exceptions: [], ...demoFields(d) });
+    store.set('demo-v2', data);
   },
 
-  async update(ev, d) {
-    const data = demoData();
-    const stored = data.events.find(e => e.id === ev.id);
-    Object.assign(stored, demoFields(d), { seed: false });
-    store.set('demo', data);
+  async getSeries(ev) {
+    const stored = demoData().events.find(e => e.id === ev.storedId);
+    return { allDay: stored.allDay, start: new Date(stored.start), end: new Date(stored.end), recurrence: stored.recurrence };
   },
 
-  async remove(ev) {
+  async update(ev, d, scope = 'this') {
     const data = demoData();
-    data.events = data.events.filter(e => e.id !== ev.id);
-    store.set('demo', data);
+    const stored = data.events.find(e => e.id === ev.storedId);
+    const add = fields => data.events.push({ id: newDemoId(), exceptions: [], ...demoFields(fields) });
+
+    if (!ev.recurring) {
+      Object.assign(stored, demoFields(d));
+    } else if (scope === 'this') {
+      stored.exceptions.push(fmtDateValue(ev.originalStart));
+      add({ ...d, recurrence: [] });
+    } else {
+      const series = await Demo.getSeries(ev);
+      if (scope === 'following' && !isFirstOccurrence(ev, series)) {
+        stored.recurrence = stored.recurrence.map(l => (isRRule(l) ? endRuleBefore(l, ev) : l));
+        add(d);
+      } else {
+        Object.assign(stored, demoFields(shiftSeries(series, ev, d)));
+      }
+    }
+    store.set('demo-v2', data);
+  },
+
+  async remove(ev, scope = 'this') {
+    const data = demoData();
+    const stored = data.events.find(e => e.id === ev.storedId);
+    const series = await Demo.getSeries(ev);
+
+    if (!ev.recurring || scope === 'all' || (scope === 'following' && isFirstOccurrence(ev, series))) {
+      data.events = data.events.filter(e => e !== stored);
+    } else if (scope === 'following') {
+      stored.recurrence = stored.recurrence.map(l => (isRRule(l) ? endRuleBefore(l, ev) : l));
+    } else {
+      stored.exceptions.push(fmtDateValue(ev.originalStart));
+    }
+    store.set('demo-v2', data);
   },
 };
 
@@ -321,8 +457,19 @@ function fromGoogle(item, calendar) {
     location: item.location || '',
     notes: htmlToText(item.description),
     recurring: Boolean(item.recurringEventId),
-    link: item.htmlLink,
+    recurringId: item.recurringEventId || null,
+    originalStart: item.originalStartTime ? read(item.originalStartTime) : null,
+    link: safeGoogleLink(item.htmlLink),
   };
+}
+
+function safeGoogleLink(url) {
+  try {
+    const { protocol, hostname } = new URL(url);
+    return protocol === 'https:' && GOOGLE_LINK_HOSTS.includes(hostname) ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 function toCalendar(item, email) {
@@ -331,7 +478,7 @@ function toCalendar(item, email) {
     id: item.id,
     account: email,
     name: item.summaryOverride || item.summary,
-    color: item.backgroundColor || '#8e8e93',
+    color: /^#[0-9a-f]{6}$/i.test(item.backgroundColor) ? item.backgroundColor : '#8e8e93',
     writable: item.accessRole === 'owner' || item.accessRole === 'writer',
     selected: Boolean(item.selected),
     primary: Boolean(item.primary),
@@ -349,6 +496,16 @@ function toGoogleTime(date, allDay, patching) {
 }
 
 const eventsPath = calendar => `/calendars/${encodeURIComponent(calendar.id)}/events`;
+const eventPath = (calendar, id) => `${eventsPath(calendar)}/${encodeURIComponent(id)}`;
+
+function eventBody(d, patching) {
+  return {
+    summary: d.title,
+    location: d.location,
+    start: toGoogleTime(d.start, d.allDay, patching),
+    end: toGoogleTime(d.end, d.allDay, patching),
+  };
+}
 
 const Google = {
   async refresh(from, to) {
@@ -394,48 +551,92 @@ const Google = {
     await googleFetch(accountOf(calendar), eventsPath(calendar), {
       method: 'POST',
       body: JSON.stringify({
-        summary: d.title,
-        location: d.location,
+        ...eventBody(d, false),
         description: d.notes,
-        start: toGoogleTime(d.start, d.allDay, false),
-        end: toGoogleTime(d.end, d.allDay, false),
+        ...(d.recurrence?.length ? { recurrence: d.recurrence } : {}),
       }),
     });
   },
 
-  async update(ev, d) {
+  async getSeries(ev) {
+    const calendar = calendarByKey(ev.calendarKey);
+    const item = await googleFetch(accountOf(calendar), eventPath(calendar, ev.recurringId));
+    const allDay = Boolean(item.start.date);
+    const read = t => (allDay ? parseDateValue(t.date) : new Date(t.dateTime));
+    return { allDay, start: read(item.start), end: read(item.end), recurrence: item.recurrence || [] };
+  },
+
+  async patchAndMove(ev, id, patch, target) {
     const source = calendarByKey(ev.calendarKey);
-    const target = calendarByKey(d.calendarKey);
-    const changesCalendar = source.key !== target.key;
-
-    // The move endpoint works within one account and rejects recurring instances.
-    if (changesCalendar && (source.account !== target.account || ev.recurring)) {
-      await Google.create(d);
-      await Google.remove(ev);
-      return;
-    }
-
     const account = accountOf(source);
-    const path = `${eventsPath(source)}/${encodeURIComponent(ev.id)}`;
-    const patch = {
-      summary: d.title,
-      location: d.location,
-      start: toGoogleTime(d.start, d.allDay, true),
-      end: toGoogleTime(d.end, d.allDay, true),
-    };
-    // Rewriting unchanged notes would drop the HTML formatting of the original.
-    if (d.notes !== ev.notes) patch.description = d.notes;
-
+    const path = eventPath(source, id);
     await googleFetch(account, path, { method: 'PATCH', body: JSON.stringify(patch) });
-    if (changesCalendar) {
+    if (source.key !== target.key) {
       const query = new URLSearchParams({ destination: target.id });
       await googleFetch(account, `${path}/move?${query}`, { method: 'POST' });
     }
   },
 
-  async remove(ev) {
+  async endSeriesBefore(ev, series) {
     const calendar = calendarByKey(ev.calendarKey);
-    await googleFetch(accountOf(calendar), `${eventsPath(calendar)}/${encodeURIComponent(ev.id)}`, { method: 'DELETE' });
+    const recurrence = series.recurrence.map(l => (isRRule(l) ? endRuleBefore(l, ev) : l));
+    await googleFetch(accountOf(calendar), eventPath(calendar, ev.recurringId), {
+      method: 'PATCH',
+      body: JSON.stringify({ recurrence }),
+    });
+  },
+
+  async update(ev, d, scope = 'this') {
+    const source = calendarByKey(ev.calendarKey);
+    const target = calendarByKey(d.calendarKey);
+    const otherAccount = source.account !== target.account;
+
+    if (ev.recurring && scope !== 'this') {
+      const series = await Google.getSeries(ev);
+      if (scope === 'following' && !isFirstOccurrence(ev, series)) {
+        await Google.create(d);
+        await Google.endSeriesBefore(ev, series);
+        return;
+      }
+      const shifted = shiftSeries(series, ev, d);
+      if (otherAccount) {
+        await Google.create(shifted);
+        await Google.remove(ev, 'all');
+        return;
+      }
+      const patch = { ...eventBody(shifted, true), recurrence: d.recurrence };
+      if (d.notes !== ev.notes) patch.description = d.notes;
+      await Google.patchAndMove(ev, ev.recurringId, patch, target);
+      return;
+    }
+
+    // The move endpoint works within one account and rejects recurring instances.
+    if (source.key !== target.key && (otherAccount || ev.recurring)) {
+      await Google.create(d);
+      await Google.remove(ev);
+      return;
+    }
+
+    const patch = eventBody(d, true);
+    // Rewriting unchanged notes would drop the HTML formatting of the original.
+    if (d.notes !== ev.notes) patch.description = d.notes;
+    if (!ev.recurring && d.recurrence?.length) patch.recurrence = d.recurrence;
+    await Google.patchAndMove(ev, ev.id, patch, target);
+  },
+
+  async remove(ev, scope = 'this') {
+    const calendar = calendarByKey(ev.calendarKey);
+    const account = accountOf(calendar);
+    if (ev.recurring && scope !== 'this') {
+      const series = await Google.getSeries(ev);
+      if (scope === 'following' && !isFirstOccurrence(ev, series)) {
+        await Google.endSeriesBefore(ev, series);
+        return;
+      }
+      await googleFetch(account, eventPath(calendar, ev.recurringId), { method: 'DELETE' });
+      return;
+    }
+    await googleFetch(account, eventPath(calendar, ev.id), { method: 'DELETE' });
   },
 };
 
@@ -790,7 +991,9 @@ function renderTimeView(days) {
   const allDayEvents = allDayPlacements(days).map(({ ev, from, to, lane }) => h('button', {
     class: 'tv-allday-ev',
     type: 'button',
-    style: `grid-column:${from + 1} / ${to + 1};grid-row:${lane + 1}`,
+    '--from': from + 1,
+    '--to': to + 1,
+    '--lane': lane + 1,
     '--c': colorOf(ev),
     title: titleOf(ev),
     onclick: e => openPopover(ev, e.currentTarget),
@@ -1031,23 +1234,26 @@ function popoverActions(ev, calendar) {
   return h('div', { class: 'pop-actions' },
     canEdit && h('button', { class: 'btn', type: 'button', onclick: () => { closePopover(); openEditor(ev); } }, 'Editar'),
     canEdit && h('button', { class: 'btn btn-danger', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(confirmDelete(ev, calendar)) }, 'Apagar'),
-    ev.link?.startsWith('https://') && h('a', { class: 'btn', href: ev.link, target: '_blank', rel: 'noopener' }, 'Abrir no Google'),
+    ev.link && h('a', { class: 'btn', href: ev.link, target: '_blank', rel: 'noopener noreferrer' }, 'Abrir no Google'),
   );
 }
 
 function confirmDelete(ev, calendar) {
-  const remove = async () => {
+  const remove = async scope => {
     try {
-      await backend.remove(ev);
+      await backend.remove(ev, scope);
       closePopover();
       await refresh();
     } catch (err) {
       toast(err.message);
     }
   };
+  const danger = (label, scope) => h('button', { class: 'btn btn-danger', type: 'button', onclick: () => remove(scope) }, label);
   return h('div', { class: 'pop-actions' },
-    h('p', { class: 'pop-confirm' }, ev.recurring ? 'Este evento repete-se. Só esta ocorrência será apagada.' : 'Apagar este evento?'),
-    h('button', { class: 'btn btn-danger', type: 'button', onclick: remove }, 'Apagar'),
+    h('p', { class: 'pop-confirm' }, ev.recurring ? 'Este evento repete-se. O que queres apagar?' : 'Apagar este evento?'),
+    ev.recurring
+      ? [danger('Só este', 'this'), danger('Este e os seguintes', 'following'), danger('Todos', 'all')]
+      : danger('Apagar', 'this'),
     h('button', { class: 'btn', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(popoverActions(ev, calendar)) }, 'Cancelar'),
   );
 }
@@ -1094,6 +1300,8 @@ const editor = {
   event: null,
   durationMs: 3600000,
   durationDays: 0,
+  kept: [],
+  otherLines: [],
 };
 
 function defaultCalendar() {
@@ -1116,11 +1324,145 @@ function fillCalendarSelect(selectedKey) {
   select.value = selectedKey;
 }
 
-function openEditor(ev, draft) {
+function repeatLabels(start) {
+  const weekday = DAYS[weekdayIndex(start)];
+  const article = weekdayIndex(start) >= 5 ? 'ao' : 'à';
+  return {
+    none: 'Não repete',
+    daily: 'Todos os dias',
+    weekdays: 'Dias úteis (segunda a sexta)',
+    weekly: `Todas as semanas ${article} ${weekday}`,
+    monthly: `Todos os meses no dia ${start.getDate()}`,
+    yearly: `Todos os anos a ${start.getDate()} de ${MONTHS[start.getMonth()].toLowerCase()}`,
+    custom: 'Personalizado',
+  };
+}
+
+function fillRepeatOptions() {
+  const select = $('ed-repeat');
+  const value = select.value;
+  const labels = repeatLabels(readStart() || new Date());
+  select.replaceChildren(
+    ...Object.entries(labels).map(([key, label]) => h('option', { value: key }, label)),
+    editor.kept.length ? h('option', { value: 'keep' }, 'Manter a repetição atual') : null,
+  );
+  select.value = value || 'none';
+}
+
+function presetOf(rule, start) {
+  const isPlain = rule.interval === 1;
+  const day = RRULE_DAYS[weekdayIndex(start)];
+  const days = (rule.byDay || [day]).join(',');
+  if (isPlain && rule.freq === 'DAILY') return 'daily';
+  if (isPlain && rule.freq === 'WEEKLY' && days === 'MO,TU,WE,TH,FR') return 'weekdays';
+  if (isPlain && rule.freq === 'WEEKLY' && days === day) return 'weekly';
+  if (isPlain && rule.freq === 'MONTHLY') return 'monthly';
+  if (isPlain && rule.freq === 'YEARLY') return 'yearly';
+  return 'custom';
+}
+
+function setWeekdays(days) {
+  for (const button of $('ed-weekdays').children) {
+    button.setAttribute('aria-pressed', String(days.includes(button.dataset.day)));
+  }
+}
+
+function loadRepeat(recurrence, start) {
+  const [line] = recurrence.filter(isRRule);
+  const rule = line ? parseRule(line) : null;
+  editor.otherLines = recurrence.filter(l => !isRRule(l));
+  editor.kept = line && !rule ? recurrence : [];
+
+  $('ed-repeat').value = '';
+  fillRepeatOptions();
+  $('ed-repeat').value = !line ? 'none' : rule ? presetOf(rule, start) : 'keep';
+  $('ed-interval').value = rule?.interval || 1;
+  $('ed-unit').value = rule?.freq || 'WEEKLY';
+  setWeekdays(rule?.byDay || [RRULE_DAYS[weekdayIndex(start)]]);
+  $('ed-ends').value = rule?.count ? 'count' : rule?.until ? 'until' : 'never';
+  $('ed-count').value = rule?.count || 10;
+  $('ed-until').value = fmtDateValue(rule?.until || addMonths(start, 3));
+}
+
+function selectedScope() {
+  return document.querySelector('input[name="ed-scope"]:checked').value;
+}
+
+function updateRepeatFields() {
+  const repeat = $('ed-repeat').value;
+  const onlyThis = Boolean(editor.event?.recurring) && selectedScope() === 'this';
+  const repeats = !onlyThis && repeat !== 'none' && repeat !== 'keep';
+  const custom = repeats && repeat === 'custom';
+
+  $('ed-repeat-row').hidden = onlyThis;
+  $('ed-custom').hidden = !custom;
+  $('ed-weekdays').hidden = !custom || $('ed-unit').value !== 'WEEKLY';
+  $('ed-ends-row').hidden = !repeats;
+  $('ed-until').hidden = $('ed-ends').value !== 'until';
+  $('ed-count').hidden = $('ed-ends').value !== 'count';
+}
+
+function readRule(start) {
+  const preset = {
+    daily: { freq: 'DAILY' },
+    weekdays: { freq: 'WEEKLY', byDay: ['MO', 'TU', 'WE', 'TH', 'FR'] },
+    weekly: { freq: 'WEEKLY', byDay: [RRULE_DAYS[weekdayIndex(start)]] },
+    monthly: { freq: 'MONTHLY' },
+    yearly: { freq: 'YEARLY' },
+  }[$('ed-repeat').value];
+
+  const interval = Number($('ed-interval').value);
+  const unit = $('ed-unit').value;
+  const days = [...$('ed-weekdays').children].filter(b => b.getAttribute('aria-pressed') === 'true').map(b => b.dataset.day);
+  const rule = preset ? { interval: 1, ...preset } : { freq: unit, interval, byDay: unit === 'WEEKLY' ? days : null };
+
+  const ends = $('ed-ends').value;
+  if (ends === 'count') rule.count = Number($('ed-count').value);
+  if (ends === 'until') {
+    const until = $('ed-until').value ? parseDateValue($('ed-until').value) : null;
+    rule.until = until && new Date(until.getFullYear(), until.getMonth(), until.getDate(), 23, 59, 59);
+  }
+  return rule;
+}
+
+function ruleError(rule, start) {
+  if (!Number.isInteger(rule.interval) || rule.interval < 1 || rule.interval > 99) return 'O intervalo tem de ser entre 1 e 99.';
+  if (rule.freq === 'WEEKLY' && !rule.byDay?.length) return 'Escolhe pelo menos um dia da semana.';
+  if ('count' in rule && (!Number.isInteger(rule.count) || rule.count < 1 || rule.count > 999)) return 'O número de vezes tem de ser entre 1 e 999.';
+  if ('until' in rule && (!rule.until || rule.until < start)) return 'A data final da repetição tem de ser depois do início.';
+  return null;
+}
+
+function readRecurrence(start, allDay) {
+  const repeat = $('ed-repeat').value;
+  if (editor.event?.recurring && selectedScope() === 'this') return [];
+  if (repeat === 'none') return [];
+  if (repeat === 'keep') return editor.kept;
+  const rule = readRule(start);
+  const error = ruleError(rule, start);
+  if (error) {
+    showEditorError(error);
+    return null;
+  }
+  return [formatRule(rule, allDay), ...editor.otherLines];
+}
+
+async function openEditor(ev, draft) {
   if (!ev && !writableCalendars().length) {
     toast('Adiciona uma conta Google com um calendário editável para criar eventos.');
     return;
   }
+
+  let series = null;
+  if (ev?.recurring) {
+    try {
+      series = await backend.getSeries(ev);
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+  }
+
   closePopover();
   closeDrawer();
   editor.event = ev || null;
@@ -1140,12 +1482,13 @@ function openEditor(ev, draft) {
   $('ed-notes').value = ev ? ev.notes : '';
   fillCalendarSelect(ev ? ev.calendarKey : defaultCalendar().key);
 
-  const hint = $('ed-hint');
-  hint.hidden = !ev?.recurring;
-  hint.textContent = 'Este evento repete-se. Só esta ocorrência será alterada.';
+  $('ed-scope').hidden = !ev?.recurring;
+  document.querySelector('input[name="ed-scope"][value="this"]').checked = true;
   showEditorError('');
   toggleAllDay();
   rememberDuration();
+  loadRepeat(series?.recurrence || [], source.start);
+  updateRepeatFields();
 
   $('editor').showModal();
   $('ed-title').focus();
@@ -1207,7 +1550,10 @@ function readEditor() {
     showEditorError('O fim tem de ser depois do início.');
     return null;
   }
+  const recurrence = readRecurrence(start, allDay);
+  if (!recurrence) return null;
   return {
+    recurrence,
     title: $('ed-title').value.trim(),
     allDay,
     start,
@@ -1226,7 +1572,7 @@ async function saveEditor(e) {
   const button = $('ed-save');
   button.disabled = true;
   try {
-    if (editor.event) await backend.update(editor.event, data);
+    if (editor.event) await backend.update(editor.event, data, editor.event.recurring ? selectedScope() : 'this');
     else await backend.create(data);
     store.set('lastCalendar', data.calendarKey);
     $('editor').close();
@@ -1282,8 +1628,19 @@ function bindEvents() {
   $('editor-form').addEventListener('submit', saveEditor);
   $('ed-cancel').addEventListener('click', () => $('editor').close());
   $('ed-allday').addEventListener('change', () => { toggleAllDay(); rememberDuration(); });
-  $('ed-start-date').addEventListener('change', followStart);
+  $('ed-start-date').addEventListener('change', () => {
+    followStart();
+    fillRepeatOptions();
+    const start = readStart();
+    if (start && $('ed-repeat').value !== 'custom') setWeekdays([RRULE_DAYS[weekdayIndex(start)]]);
+  });
   $('ed-end-date').addEventListener('change', rememberDuration);
+  for (const id of ['ed-repeat', 'ed-unit', 'ed-ends']) $(id).addEventListener('change', updateRepeatFields);
+  $('ed-scope').addEventListener('change', updateRepeatFields);
+  $('ed-weekdays').addEventListener('click', e => {
+    const button = e.target.closest('button');
+    if (button) button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
+  });
   for (const [id, onChange] of [['ed-start-time', followStart], ['ed-end-time', rememberDuration]]) {
     $(id).addEventListener('change', e => { normaliseTimeField(e.target); onChange(); });
   }
@@ -1384,8 +1741,14 @@ function tick() {
 /* Start */
 
 function start() {
+  // Pages cannot send frame-ancestors, so a framed copy refuses to run.
+  if (window.top !== window.self) {
+    document.body.replaceChildren();
+    return;
+  }
   if (store.get('sidebarHidden', false)) document.body.classList.add('sidebar-hidden');
   $('time-options').append(...Array.from({ length: 48 }, (_, i) => h('option', { value: `${pad(Math.floor(i / 2))}:${pad((i % 2) * 30)}` })));
+  $('ed-weekdays').append(...RRULE_DAYS.map((day, i) => h('button', { type: 'button', 'data-day': day, 'aria-pressed': 'false', 'aria-label': DAYS[i] }, DAYS_MINI[i])));
 
   bindEvents();
   if (!IS_DEMO) {

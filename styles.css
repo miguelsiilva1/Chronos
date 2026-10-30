@@ -85,6 +85,8 @@ body {
   overflow: hidden;
 }
 
+body.legal-page { overflow: auto; }
+
 h1, h2, p, ul { margin: 0; padding: 0; }
 ul { list-style: none; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -411,6 +413,8 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .tv-allday-cell { border-left: 1px solid var(--line); }
 
 .tv-allday-ev {
+  grid-column: var(--from) / var(--to);
+  grid-row: var(--lane);
   z-index: 1;
   min-width: 0;
   margin: 0 3px;
@@ -720,9 +724,38 @@ textarea.input { resize: vertical; }
 
 .is-all-day .input-time { display: none; }
 
-.editor-hint, .editor-error { margin-top: var(--space-2); font-size: var(--fs-m); }
-.editor-hint { color: var(--text-2); }
-.editor-error { color: var(--accent); font-weight: 500; }
+.editor-error { margin-top: var(--space-2); font-size: var(--fs-m); color: var(--accent); font-weight: 500; }
+
+.weekdays { display: flex; gap: var(--space-1); margin: 0 0 var(--space-2) 88px; }
+
+.weekdays button {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-s);
+  font-weight: 500;
+  transition: background var(--speed);
+}
+
+.weekdays button:hover { background: var(--bg-hover); }
+.weekdays button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+
+.scope { margin: var(--space-3) 0 0; padding: var(--space-3); border: 1px solid var(--line-2); border-radius: var(--radius-m); }
+.scope legend { padding: 0 var(--space-1); font-size: var(--fs-m); color: var(--text-2); }
+.scope label { display: flex; align-items: center; gap: var(--space-2); padding: 2px 0; font-size: var(--fs-m); cursor: pointer; }
+.scope input { accent-color: var(--accent); margin: 0; }
+
+.side-links { display: flex; gap: var(--space-3); }
+.side-links a { color: var(--text-3); text-decoration: none; transition: color var(--speed); }
+.side-links a:hover { color: var(--text); }
+
+.legal { max-width: 68ch; margin: 0 auto; padding: var(--space-6) var(--space-4); line-height: 1.6; }
+.legal h1 { font-size: var(--fs-title); letter-spacing: -.02em; line-height: 1.2; margin-bottom: var(--space-2); }
+.legal h2 { font-size: var(--fs-l); margin: var(--space-5) 0 var(--space-2); }
+.legal p, .legal ul { margin-bottom: var(--space-3); }
+.legal ul { padding-left: var(--space-5); list-style: disc; }
+.legal a { color: var(--accent); }
 
 .editor-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-4); }
 
@@ -808,6 +841,7 @@ textarea.input { resize: vertical; }
   .check { margin-left: 0; }
   .field-row label { width: 68px; }
   .input-time { width: 76px; }
+  .weekdays { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

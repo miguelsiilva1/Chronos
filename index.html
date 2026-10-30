@@ -2,6 +2,7 @@
 <html lang="pt-PT">
 <head>
   <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' https://fonts.googleapis.com https://accounts.google.com/gsi/style; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://www.googleapis.com https://accounts.google.com/gsi/; frame-src https://accounts.google.com/gsi/; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Chronos</title>
   <meta name="description" content="Calendário minimalista ligado ao Google Calendar.">
@@ -45,6 +46,7 @@
       <div class="side-foot">
         <button class="btn btn-block" id="install" type="button" hidden>Instalar app</button>
         <p id="demo-note" hidden>Modo demonstração. Os eventos ficam só neste browser. Para ligar ao Google Calendar, preenche o <code>config.js</code>.</p>
+        <p class="side-links"><a href="privacy.html">Privacidade</a> <a href="terms.html">Termos</a></p>
       </div>
     </aside>
     <div class="scrim" id="scrim"></div>
@@ -117,7 +119,41 @@
         <textarea class="input" id="ed-notes" rows="3"></textarea>
       </div>
 
-      <p class="editor-hint" id="ed-hint" hidden></p>
+      <div class="field-row" id="ed-repeat-row">
+        <label for="ed-repeat">Repetir</label>
+        <select class="input" id="ed-repeat"></select>
+      </div>
+      <div id="ed-custom" hidden>
+        <div class="field-row">
+          <label for="ed-interval">A cada</label>
+          <input class="input input-time" id="ed-interval" type="number" min="1" max="99" value="1">
+          <select class="input" id="ed-unit" aria-label="Unidade">
+            <option value="DAILY">dias</option>
+            <option value="WEEKLY">semanas</option>
+            <option value="MONTHLY">meses</option>
+            <option value="YEARLY">anos</option>
+          </select>
+        </div>
+        <div class="weekdays" id="ed-weekdays" role="group" aria-label="Dias da semana"></div>
+      </div>
+      <div class="field-row" id="ed-ends-row">
+        <label for="ed-ends">Termina</label>
+        <select class="input" id="ed-ends">
+          <option value="never">Nunca</option>
+          <option value="until">Numa data</option>
+          <option value="count">Depois de várias vezes</option>
+        </select>
+        <input class="input" id="ed-until" type="date" aria-label="Data final">
+        <input class="input input-time" id="ed-count" type="number" min="1" max="999" aria-label="Número de vezes">
+      </div>
+
+      <fieldset class="scope" id="ed-scope" hidden>
+        <legend>Este evento repete-se. Aplicar a:</legend>
+        <label><input type="radio" name="ed-scope" value="this" checked> Só este evento</label>
+        <label><input type="radio" name="ed-scope" value="following"> Este e os seguintes</label>
+        <label><input type="radio" name="ed-scope" value="all"> Todos os eventos</label>
+      </fieldset>
+
       <p class="editor-error" id="ed-error" role="alert" hidden></p>
 
       <div class="editor-actions">
