@@ -46,7 +46,7 @@ Google Calendar does a lot, and its interface shows all of it. Chronos keeps the
 3. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
 4. Select the `main` branch and the `/ (root)` folder, then click **Save**.
 
-The app runs in demo mode until you add a client ID.
+This repository's `config.js` holds a client ID that only works on its own origin. In your copy, replace it with your own, or leave it empty to run in demo mode.
 
 ### Run locally
 
