@@ -1,0 +1,16 @@
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+
+# Build and dependencies
+node_modules/
+dist/
+
+# Local files
+.env
+*.zip
