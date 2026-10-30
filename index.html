@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="pt-PT">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Chronos</title>
+  <meta name="description" content="Calendário minimalista ligado ao Google Calendar.">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1c1c1e">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="Barra lateral">
+      <section class="mini" aria-label="Mini calendário">
+        <div class="mini-head">
+          <h2 id="mini-title"></h2>
+          <button class="icon-btn" id="mini-prev" type="button" aria-label="Mês anterior">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+          </button>
+          <button class="icon-btn" id="mini-next" type="button" aria-label="Mês seguinte">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+          </button>
+        </div>
+        <div class="mini-grid" id="mini-grid"></div>
+      </section>
+
+      <section class="side-section">
+        <h2>Calendários</h2>
+        <div id="calendar-list"></div>
+      </section>
+
+      <section class="side-section" id="account-section" hidden>
+        <h2>Contas</h2>
+        <ul class="account-list" id="account-list"></ul>
+        <button class="btn btn-block" id="add-account" type="button">Adicionar conta Google</button>
+      </section>
+
+      <div class="side-foot">
+        <button class="btn btn-block" id="install" type="button" hidden>Instalar app</button>
+        <p id="demo-note" hidden>Modo demonstração. Os eventos ficam só neste browser. Para ligar ao Google Calendar, preenche o <code>config.js</code>.</p>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn" id="toggle-sidebar" type="button" aria-label="Mostrar ou esconder a barra lateral">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="2.5"/><path d="M6 2.5v11"/></svg>
+        </button>
+        <h1 class="title" id="title"></h1>
+        <span class="status" id="status"></span>
+        <button class="btn btn-session" id="reauth" type="button" hidden></button>
+        <span class="topbar-gap"></span>
+        <div class="segmented" id="views" role="group" aria-label="Vista">
+          <button type="button" data-view="day">Dia</button>
+          <button type="button" data-view="week">Semana</button>
+          <button type="button" data-view="month">Mês</button>
+        </div>
+        <div class="nav">
+          <button class="icon-btn" id="prev" type="button" aria-label="Anterior">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+          </button>
+          <button class="btn" id="today" type="button">Hoje</button>
+          <button class="icon-btn" id="next" type="button" aria-label="Seguinte">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+          </button>
+        </div>
+        <button class="btn-add" id="new-event" type="button" aria-label="Novo evento">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+        </button>
+      </header>
+      <div class="view" id="view"></div>
+    </main>
+  </div>
+
+  <div class="popover" id="popover" role="dialog" aria-label="Detalhes do evento" tabindex="-1" hidden></div>
+
+  <dialog class="editor" id="editor" aria-labelledby="editor-title">
+    <form id="editor-form" novalidate>
+      <h2 id="editor-title">Novo evento</h2>
+      <input class="input input-title" id="ed-title" type="text" placeholder="Título" aria-label="Título" autocomplete="off">
+
+      <label class="check">
+        <input id="ed-allday" type="checkbox">
+        <span>Dia todo</span>
+      </label>
+
+      <div class="field-row">
+        <label for="ed-start-date">Início</label>
+        <input class="input" id="ed-start-date" type="date">
+        <input class="input input-time" id="ed-start-time" type="text" inputmode="numeric" list="time-options" maxlength="5" placeholder="09:00" aria-label="Hora de início" autocomplete="off">
+      </div>
+      <div class="field-row">
+        <label for="ed-end-date">Fim</label>
+        <input class="input" id="ed-end-date" type="date">
+        <input class="input input-time" id="ed-end-time" type="text" inputmode="numeric" list="time-options" maxlength="5" placeholder="10:00" aria-label="Hora de fim" autocomplete="off">
+      </div>
+      <datalist id="time-options"></datalist>
+
+      <div class="field-row">
+        <label for="ed-calendar">Calendário</label>
+        <select class="input" id="ed-calendar"></select>
+      </div>
+      <div class="field-row">
+        <label for="ed-location">Local</label>
+        <input class="input" id="ed-location" type="text" autocomplete="off">
+      </div>
+      <div class="field-row field-top">
+        <label for="ed-notes">Notas</label>
+        <textarea class="input" id="ed-notes" rows="3"></textarea>
+      </div>
+
+      <p class="editor-hint" id="ed-hint" hidden></p>
+      <p class="editor-error" id="ed-error" role="alert" hidden></p>
+
+      <div class="editor-actions">
+        <button class="btn" id="ed-cancel" type="button">Cancelar</button>
+        <button class="btn btn-primary" id="ed-save" type="submit">Guardar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

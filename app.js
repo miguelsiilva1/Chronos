@@ -1,0 +1,1402 @@
+'use strict';
+
+const CLIENT_ID = (window.GOOGLE_CLIENT_ID || '').trim();
+const IS_DEMO = !CLIENT_ID;
+
+const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
+const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const GIS_URL = 'https://accounts.google.com/gsi/client';
+const SCOPE_EVENTS = 'https://www.googleapis.com/auth/calendar.events';
+const SCOPE_CALENDARS = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly';
+const SCOPES = [SCOPE_EVENTS, SCOPE_CALENDARS, 'openid', 'email'].join(' ');
+
+const SYNC_INTERVAL = 5 * 60 * 1000;
+const FOCUS_THROTTLE = 10 * 1000;
+const SNAP_MINUTES = 15;
+const DAY_MINUTES = 24 * 60;
+const MIN_EVENT_MINUTES = 20;
+const SHORT_EVENT_MINUTES = 40;
+const MONTH_LINE = 20;
+
+const MONTHS = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+const MONTHS_SHORT = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+const DAYS = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo'];
+const DAYS_SHORT = ['seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'];
+const DAYS_MINI = ['S', 'T', 'Q', 'Q', 'S', 'S', 'D'];
+
+const $ = id => document.getElementById(id);
+
+/* Dates */
+
+const pad = n => String(n).padStart(2, '0');
+const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, d.getHours(), d.getMinutes());
+const sameDay = (a, b) => startOfDay(a).getTime() === startOfDay(b).getTime();
+const weekdayIndex = d => (d.getDay() + 6) % 7;
+const startOfWeek = d => addDays(startOfDay(d), -weekdayIndex(d));
+const isWeekend = d => weekdayIndex(d) >= 5;
+const minutesOf = d => d.getHours() * 60 + d.getMinutes();
+const fmtTime = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const fmtDateValue = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const fmtLong = d => `${DAYS[weekdayIndex(d)]}, ${d.getDate()} de ${MONTHS[d.getMonth()].toLowerCase()}`;
+
+// Calendar days between two dates, safe across DST changes.
+const dayDiff = (a, b) => Math.round((startOfDay(b) - startOfDay(a)) / 864e5);
+
+function parseDateValue(value) {
+  const [y, m, d] = value.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function atMinutes(day, minutes) {
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, minutes);
+}
+
+function addMonths(d, n) {
+  const last = new Date(d.getFullYear(), d.getMonth() + n + 1, 0).getDate();
+  return new Date(d.getFullYear(), d.getMonth() + n, Math.min(d.getDate(), last));
+}
+
+// Accepts "9", "930", "9:30" and "09:30".
+function parseTime(value) {
+  const match = value.trim().match(/^(\d{1,2})(?::?(\d{2}))?$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2] || 0);
+  return hours < 24 && minutes < 60 ? hours * 60 + minutes : null;
+}
+
+/* Storage */
+
+const store = {
+  get(key, fallback) {
+    try {
+      const value = localStorage.getItem(`chronos.${key}`);
+      return value === null ? fallback : JSON.parse(value);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(`chronos.${key}`, JSON.stringify(value));
+    } catch {
+      toast('Não foi possível guardar neste browser.');
+    }
+  },
+};
+
+/* DOM */
+
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === 'class') el.className = value;
+    else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
+    else if (key.startsWith('--')) el.style.setProperty(key, value);
+    else el.setAttribute(key, value === true ? '' : value);
+  }
+  el.append(...children.flat().filter(c => c !== null && c !== undefined && c !== false));
+  return el;
+}
+
+let toastTimer;
+function toast(message) {
+  const el = $('toast');
+  el.textContent = message;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+/* State */
+
+const state = {
+  view: store.get('view', 'week'),
+  date: startOfDay(new Date()),
+  miniMonth: startOfDay(new Date()),
+  calendars: [],
+  events: [],
+  accounts: store.get('accounts', []),
+  visibility: store.get('visibility', {}),
+  loaded: null,
+  updatedAt: null,
+  syncFailed: false,
+};
+
+const calendarByKey = key => state.calendars.find(c => c.key === key);
+const isVisible = cal => state.visibility[cal.key] ?? cal.selected;
+const titleOf = ev => ev.title || 'Sem título';
+const colorOf = ev => calendarByKey(ev.calendarKey)?.color || 'var(--text-3)';
+const isAccountLive = account => Date.now() < account.expiresAt;
+const expiredAccounts = () => state.accounts.filter(a => !isAccountLive(a));
+const writableCalendars = () => state.calendars.filter(c => c.writable);
+
+function visibleEvents() {
+  return state.events.filter(ev => {
+    const cal = calendarByKey(ev.calendarKey);
+    return cal && isVisible(cal);
+  });
+}
+
+// Timed events of 24h or more sit in the all-day row, as in Google Calendar.
+const inAllDayRow = ev => ev.allDay || ev.end - ev.start >= 864e5;
+
+/* Demo backend */
+
+const DEMO_CALENDARS = [
+  { key: 'faculdade', name: 'Faculdade', color: '#3b82f6' },
+  { key: 'pessoal', name: 'Pessoal', color: '#34a853' },
+  { key: 'treino', name: 'Treino', color: '#f59e42' },
+].map(c => ({ ...c, id: c.key, account: null, writable: true, selected: true }));
+
+function demoSeed() {
+  const week = startOfWeek(new Date());
+  const events = [];
+  const add = (calendarId, title, day, startMin, endMin, extra) => events.push({
+    id: `seed-${events.length}`,
+    calendarId,
+    title,
+    allDay: false,
+    start: atMinutes(addDays(week, day), startMin).toISOString(),
+    end: atMinutes(addDays(week, day), endMin).toISOString(),
+    location: '',
+    notes: '',
+    recurring: false,
+    seed: true,
+    ...extra,
+  });
+  const addAllDay = (calendarId, title, day, length) => add(calendarId, title, day, 0, 0, {
+    allDay: true,
+    end: addDays(week, day + length).toISOString(),
+  });
+
+  for (let w = -3; w <= 3; w++) {
+    const day = n => w * 7 + n;
+    const weekly = { recurring: true };
+    add('faculdade', 'Aula teórica', day(0), 540, 660, { ...weekly, location: 'Sala B201' });
+    add('faculdade', 'Aula teórica', day(3), 540, 660, { ...weekly, location: 'Sala B201' });
+    add('faculdade', 'Aula prática', day(1), 840, 960, { ...weekly, location: 'Laboratório 3' });
+    add('treino', 'Ginásio', day(0), 1140, 1230, weekly);
+    add('treino', 'Ginásio', day(2), 1140, 1230, weekly);
+    add('treino', 'Ginásio', day(4), 1080, 1170, weekly);
+  }
+
+  add('pessoal', 'Dentista', 1, 600, 645, { location: 'Clínica da Baixa' });
+  add('faculdade', 'Reunião de grupo', 2, 1080, 1140, { notes: 'Rever a apresentação e dividir tarefas.' });
+  add('pessoal', 'Almoço com a Marta', 3, 750, 810);
+  add('faculdade', 'Orientação de projeto', 3, 780, 840, { location: 'Gabinete 2.14' });
+  addAllDay('faculdade', 'Entrega do projeto', 4, 1);
+  add('pessoal', 'Jantar de família', 5, 1200, 1320);
+  add('pessoal', 'Consulta de rotina', 8, 930, 975);
+  addAllDay('faculdade', 'Semana de exames', 14, 5);
+  addAllDay('pessoal', 'Aniversário da Inês', -5, 1);
+
+  return events;
+}
+
+function demoData() {
+  const data = store.get('demo', { week: null, events: [] });
+  const week = fmtDateValue(startOfWeek(new Date()));
+  if (data.week !== week) {
+    data.week = week;
+    data.events = data.events.filter(e => !e.seed).concat(demoSeed());
+    store.set('demo', data);
+  }
+  return data;
+}
+
+function demoFields(d) {
+  return {
+    calendarId: d.calendarKey,
+    title: d.title,
+    allDay: d.allDay,
+    start: d.start.toISOString(),
+    end: d.end.toISOString(),
+    location: d.location,
+    notes: d.notes,
+  };
+}
+
+const Demo = {
+  async refresh(from, to) {
+    const events = demoData().events
+      .map(e => ({
+        key: e.id,
+        id: e.id,
+        calendarKey: e.calendarId,
+        title: e.title,
+        allDay: e.allDay,
+        start: new Date(e.start),
+        end: new Date(e.end),
+        location: e.location,
+        notes: e.notes,
+        recurring: e.recurring,
+        link: null,
+      }))
+      .filter(e => e.start < to && e.end > from);
+    return { calendars: DEMO_CALENDARS, events, failures: 0 };
+  },
+
+  async create(d) {
+    const data = demoData();
+    data.events.push({ id: `ev-${Date.now()}`, recurring: false, ...demoFields(d) });
+    store.set('demo', data);
+  },
+
+  async update(ev, d) {
+    const data = demoData();
+    const stored = data.events.find(e => e.id === ev.id);
+    Object.assign(stored, demoFields(d), { seed: false });
+    store.set('demo', data);
+  },
+
+  async remove(ev) {
+    const data = demoData();
+    data.events = data.events.filter(e => e.id !== ev.id);
+    store.set('demo', data);
+  },
+};
+
+/* Google backend */
+
+function saveAccounts() {
+  store.set('accounts', state.accounts);
+}
+
+function accountOf(calendar) {
+  return state.accounts.find(a => a.email === calendar.account);
+}
+
+async function googleFetch(account, path, options = {}) {
+  const res = await fetch(`${CALENDAR_API}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${account.token}`,
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+  });
+  if (res.status === 401) {
+    account.expiresAt = 0;
+    saveAccounts();
+    renderSession();
+    throw new Error(`A sessão de ${account.email} expirou. Usa "reativar" no topo.`);
+  }
+  if (res.status === 403) throw new Error('O Google recusou esta operação: não tens permissão neste calendário ou evento.');
+  if (!res.ok) throw new Error(`O Google devolveu o erro ${res.status}. Tenta de novo.`);
+  return res.status === 204 ? null : res.json();
+}
+
+async function googleList(account, path, params) {
+  const items = [];
+  let pageToken;
+  do {
+    const query = new URLSearchParams({ ...params, ...(pageToken ? { pageToken } : {}) });
+    const page = await googleFetch(account, `${path}?${query}`);
+    items.push(...(page.items || []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+  return items;
+}
+
+// Event descriptions from Google can hold HTML. Only the text is ever shown.
+function htmlToText(html) {
+  if (!html) return '';
+  const withBreaks = html.replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li)>/gi, '\n');
+  return new DOMParser().parseFromString(withBreaks, 'text/html').body.textContent.trim();
+}
+
+function fromGoogle(item, calendar) {
+  const allDay = Boolean(item.start.date);
+  const read = t => (allDay ? parseDateValue(t.date) : new Date(t.dateTime));
+  return {
+    key: `${calendar.key}|${item.id}`,
+    id: item.id,
+    calendarKey: calendar.key,
+    title: item.summary || '',
+    allDay,
+    start: read(item.start),
+    end: read(item.end),
+    location: item.location || '',
+    notes: htmlToText(item.description),
+    recurring: Boolean(item.recurringEventId),
+    link: item.htmlLink,
+  };
+}
+
+function toCalendar(item, email) {
+  return {
+    key: `${email}|${item.id}`,
+    id: item.id,
+    account: email,
+    name: item.summaryOverride || item.summary,
+    color: item.backgroundColor || '#8e8e93',
+    writable: item.accessRole === 'owner' || item.accessRole === 'writer',
+    selected: Boolean(item.selected),
+    primary: Boolean(item.primary),
+  };
+}
+
+// patching: PATCH merges start and end, so switching to or from all-day must clear the other field.
+function toGoogleTime(date, allDay, patching) {
+  if (allDay) return { date: fmtDateValue(date), ...(patching ? { dateTime: null } : {}) };
+  return {
+    dateTime: date.toISOString(),
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    ...(patching ? { date: null } : {}),
+  };
+}
+
+const eventsPath = calendar => `/calendars/${encodeURIComponent(calendar.id)}/events`;
+
+const Google = {
+  async refresh(from, to) {
+    const events = [];
+    let failures = 0;
+
+    await Promise.all(state.accounts.map(async account => {
+      const previous = () => state.events.filter(e => calendarByKey(e.calendarKey)?.account === account.email);
+      if (!isAccountLive(account)) {
+        events.push(...previous());
+        return;
+      }
+      try {
+        const items = await googleList(account, '/users/me/calendarList', { maxResults: 250 });
+        account.calendars = items.map(item => toCalendar(item, account.email));
+      } catch (err) {
+        if (isAccountLive(account)) failures++;
+        events.push(...previous());
+        return;
+      }
+      await Promise.all(account.calendars.map(async calendar => {
+        try {
+          const items = await googleList(account, eventsPath(calendar), {
+            timeMin: from.toISOString(),
+            timeMax: to.toISOString(),
+            singleEvents: 'true',
+            orderBy: 'startTime',
+            maxResults: 2500,
+          });
+          events.push(...items.filter(i => i.status !== 'cancelled').map(i => fromGoogle(i, calendar)));
+        } catch (err) {
+          if (isAccountLive(account)) failures++;
+        }
+      }));
+    }));
+
+    saveAccounts();
+    return { calendars: state.accounts.flatMap(a => a.calendars), events, failures };
+  },
+
+  async create(d) {
+    const calendar = calendarByKey(d.calendarKey);
+    await googleFetch(accountOf(calendar), eventsPath(calendar), {
+      method: 'POST',
+      body: JSON.stringify({
+        summary: d.title,
+        location: d.location,
+        description: d.notes,
+        start: toGoogleTime(d.start, d.allDay, false),
+        end: toGoogleTime(d.end, d.allDay, false),
+      }),
+    });
+  },
+
+  async update(ev, d) {
+    const source = calendarByKey(ev.calendarKey);
+    const target = calendarByKey(d.calendarKey);
+    const changesCalendar = source.key !== target.key;
+
+    // The move endpoint works within one account and rejects recurring instances.
+    if (changesCalendar && (source.account !== target.account || ev.recurring)) {
+      await Google.create(d);
+      await Google.remove(ev);
+      return;
+    }
+
+    const account = accountOf(source);
+    const path = `${eventsPath(source)}/${encodeURIComponent(ev.id)}`;
+    const patch = {
+      summary: d.title,
+      location: d.location,
+      start: toGoogleTime(d.start, d.allDay, true),
+      end: toGoogleTime(d.end, d.allDay, true),
+    };
+    // Rewriting unchanged notes would drop the HTML formatting of the original.
+    if (d.notes !== ev.notes) patch.description = d.notes;
+
+    await googleFetch(account, path, { method: 'PATCH', body: JSON.stringify(patch) });
+    if (changesCalendar) {
+      const query = new URLSearchParams({ destination: target.id });
+      await googleFetch(account, `${path}/move?${query}`, { method: 'POST' });
+    }
+  },
+
+  async remove(ev) {
+    const calendar = calendarByKey(ev.calendarKey);
+    await googleFetch(accountOf(calendar), `${eventsPath(calendar)}/${encodeURIComponent(ev.id)}`, { method: 'DELETE' });
+  },
+};
+
+const backend = IS_DEMO ? Demo : Google;
+
+/* Google sign-in */
+
+function requestToken(loginHint, prompt) {
+  return new Promise((resolve, reject) => {
+    if (!window.google?.accounts?.oauth2) {
+      reject(new Error('O início de sessão do Google ainda não carregou. Verifica a ligação e tenta de novo.'));
+      return;
+    }
+    const client = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPES,
+      login_hint: loginHint,
+      prompt,
+      callback: response => {
+        if (response.error) reject(new Error(`O Google recusou o acesso (${response.error}).`));
+        else if (!google.accounts.oauth2.hasGrantedAllScopes(response, SCOPE_EVENTS, SCOPE_CALENDARS)) {
+          reject(new Error('Falta dar acesso ao calendário. Tenta de novo e marca todas as permissões.'));
+        } else resolve(response);
+      },
+      error_callback: error => {
+        reject(new Error(error.type === 'popup_failed_to_open'
+          ? 'O browser bloqueou a janela do Google. Permite pop-ups neste site e tenta de novo.'
+          : 'A janela do Google foi fechada antes de terminar.'));
+      },
+    });
+    client.requestAccessToken();
+  });
+}
+
+// Must run directly from a click: the popup is blocked otherwise.
+async function connectAccount(loginHint, prompt) {
+  try {
+    const token = await requestToken(loginHint, prompt);
+    const res = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${token.access_token}` } });
+    if (!res.ok) throw new Error('Não foi possível obter o email da conta. Tenta de novo.');
+    const { email } = await res.json();
+
+    let account = state.accounts.find(a => a.email === email);
+    if (!account) {
+      account = { email, calendars: [] };
+      state.accounts.push(account);
+    }
+    account.token = token.access_token;
+    account.expiresAt = Date.now() + Number(token.expires_in) * 1000;
+    saveAccounts();
+    await refresh();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function removeAccount(account) {
+  state.accounts = state.accounts.filter(a => a !== account);
+  saveAccounts();
+  state.calendars = state.accounts.flatMap(a => a.calendars);
+  state.events = state.events.filter(e => calendarByKey(e.calendarKey));
+  render();
+}
+
+function loadGoogleScript() {
+  document.head.append(h('script', { src: GIS_URL, async: true, defer: true }));
+}
+
+/* Loading */
+
+function viewDays() {
+  if (state.view === 'day') return [state.date];
+  const first = startOfWeek(state.date);
+  return Array.from({ length: 7 }, (_, i) => addDays(first, i));
+}
+
+function monthGridStart(date) {
+  return startOfWeek(new Date(date.getFullYear(), date.getMonth(), 1));
+}
+
+function loadRange(date) {
+  const first = monthGridStart(date);
+  return { from: addDays(first, -7), to: addDays(first, 49) };
+}
+
+function isLoaded(date) {
+  const { loaded } = state;
+  if (!loaded) return false;
+  const grid = monthGridStart(date);
+  return grid >= loaded.from && addDays(grid, 42) <= loaded.to;
+}
+
+let refreshRun = 0;
+async function refresh() {
+  const run = ++refreshRun;
+  const range = loadRange(state.date);
+  try {
+    const { calendars, events, failures } = await backend.refresh(range.from, range.to);
+    if (run !== refreshRun) return;
+    state.calendars = calendars;
+    state.events = events;
+    state.loaded = range;
+    state.syncFailed = failures > 0;
+    if (!failures) state.updatedAt = new Date();
+  } catch (err) {
+    if (run !== refreshRun) return;
+    state.syncFailed = true;
+  }
+  render();
+}
+
+/* Navigation */
+
+function goTo(date, view) {
+  state.date = startOfDay(date);
+  state.miniMonth = state.date;
+  if (view && view !== state.view) {
+    state.view = view;
+    store.set('view', view);
+  }
+  closePopover();
+  render();
+  if (!isLoaded(state.date)) refresh();
+}
+
+function step(direction) {
+  if (state.view === 'month') goTo(addMonths(state.date, direction));
+  else goTo(addDays(state.date, direction * (state.view === 'week' ? 7 : 1)));
+}
+
+/* Rendering */
+
+function render() {
+  if (drag) {
+    drag.renderPending = true;
+    return;
+  }
+  renderTitle();
+  renderStatus();
+  renderSession();
+  renderMini();
+  renderSidebar();
+  renderView();
+}
+
+function titleParts() {
+  const d = state.date;
+  if (state.view === 'month') return [MONTHS[d.getMonth()], d.getFullYear()];
+  if (state.view === 'day') return [`${d.getDate()} de ${MONTHS[d.getMonth()].toLowerCase()}`, d.getFullYear()];
+
+  const a = startOfWeek(d);
+  const b = addDays(a, 6);
+  if (a.getMonth() === b.getMonth()) return [MONTHS[a.getMonth()], a.getFullYear()];
+  const first = MONTHS_SHORT[a.getMonth()];
+  const capitalised = first[0].toUpperCase() + first.slice(1);
+  if (a.getFullYear() === b.getFullYear()) return [`${capitalised} – ${MONTHS_SHORT[b.getMonth()]}`, a.getFullYear()];
+  return [`${capitalised} ${a.getFullYear()} – ${MONTHS_SHORT[b.getMonth()]}`, b.getFullYear()];
+}
+
+function renderTitle() {
+  const [main, year] = titleParts();
+  $('title').replaceChildren(main, h('span', {}, year));
+  for (const button of $('views').children) {
+    button.setAttribute('aria-pressed', String(button.dataset.view === state.view));
+  }
+}
+
+function renderStatus() {
+  let text = '';
+  if (IS_DEMO) text = 'Modo demonstração';
+  else if (!state.accounts.length) text = 'Adiciona uma conta Google para ver os teus eventos';
+  else if (state.syncFailed) text = 'Não foi possível atualizar';
+  else if (state.updatedAt) text = `Atualizado às ${fmtTime(state.updatedAt)}`;
+  $('status').textContent = text;
+}
+
+function renderSession() {
+  const expired = expiredAccounts();
+  const button = $('reauth');
+  button.hidden = !expired.length;
+  button.textContent = `Sessão expirada · reativar${expired.length > 1 ? ` (${expired.length})` : ''}`;
+  button.title = expired.map(a => a.email).join(', ');
+}
+
+function renderMini() {
+  const month = state.miniMonth;
+  $('mini-title').textContent = `${MONTHS[month.getMonth()]} ${month.getFullYear()}`;
+
+  const today = new Date();
+  const first = monthGridStart(month);
+  const rangeStart = state.view === 'month' ? null : viewDays()[0];
+  const rangeEnd = state.view === 'month' ? null : viewDays().at(-1);
+
+  const cells = DAYS_MINI.map(label => h('div', { class: 'mini-label' }, label));
+  for (let i = 0; i < 42; i++) {
+    const day = addDays(first, i);
+    const classes = ['mini-day'];
+    if (day.getMonth() !== month.getMonth()) classes.push('is-out');
+    if (sameDay(day, today)) classes.push('is-today');
+    if (rangeStart && day >= rangeStart && day <= rangeEnd) {
+      classes.push('in-range');
+      if (sameDay(day, rangeStart)) classes.push('range-start');
+      if (sameDay(day, rangeEnd)) classes.push('range-end');
+    }
+    cells.push(h('button', {
+      class: classes.join(' '),
+      type: 'button',
+      'aria-label': fmtLong(day),
+      onclick: () => { goTo(day); closeDrawer(); },
+    }, h('span', {}, day.getDate())));
+  }
+  $('mini-grid').replaceChildren(...cells);
+}
+
+function renderSidebar() {
+  const groups = IS_DEMO
+    ? [{ name: null, calendars: state.calendars }]
+    : state.accounts.map(a => ({ name: a.email, calendars: a.calendars }));
+
+  $('calendar-list').replaceChildren(...groups.map(group => h('div', { class: 'cal-group' },
+    group.name && h('div', { class: 'cal-group-name' }, group.name),
+    group.calendars.map(cal => h('label', { class: 'cal-row', '--c': cal.color },
+      h('input', {
+        type: 'checkbox',
+        checked: isVisible(cal),
+        onchange: e => {
+          state.visibility[cal.key] = e.target.checked;
+          store.set('visibility', state.visibility);
+          closePopover();
+          renderView();
+        },
+      }),
+      h('span', {}, cal.name),
+    )),
+  )));
+
+  $('account-section').hidden = IS_DEMO;
+  $('demo-note').hidden = !IS_DEMO;
+  $('account-list').replaceChildren(...state.accounts.map(account => h('li', { class: isAccountLive(account) ? '' : 'is-expired' },
+    h('span', { title: account.email }, account.email),
+    h('button', { class: 'link-btn', type: 'button', onclick: () => removeAccount(account) }, 'Remover'),
+  )));
+}
+
+function renderView() {
+  if (state.view === 'month') renderMonth();
+  else renderTimeView(viewDays());
+}
+
+/* Week and day view */
+
+function allDayPlacements(days) {
+  const first = days[0];
+  const count = days.length;
+  const after = addDays(first, count);
+  const lanes = [];
+
+  return visibleEvents()
+    .filter(ev => inAllDayRow(ev) && ev.start < after && ev.end > first)
+    .sort((a, b) => a.start - b.start || b.end - a.end)
+    .map(ev => {
+      const endsAtMidnight = minutesOf(ev.end) === 0;
+      const from = Math.max(0, dayDiff(first, ev.start));
+      const to = Math.min(count, dayDiff(first, ev.end) + (endsAtMidnight ? 0 : 1));
+      let lane = lanes.findIndex(end => end <= from);
+      if (lane < 0) lane = lanes.length;
+      lanes[lane] = to;
+      return { ev, from, to, lane };
+    });
+}
+
+function timedSegments(day) {
+  const next = addDays(day, 1);
+  return visibleEvents()
+    .filter(ev => !inAllDayRow(ev) && ev.start < next && ev.end > day)
+    .map(ev => {
+      const start = ev.start < day ? 0 : minutesOf(ev.start);
+      const end = ev.end >= next ? DAY_MINUTES : minutesOf(ev.end);
+      return { ev, start, end: Math.min(DAY_MINUTES, Math.max(end, start + MIN_EVENT_MINUTES)) };
+    });
+}
+
+// Overlapping events share the column width.
+function layoutOverlaps(segments) {
+  segments.sort((a, b) => a.start - b.start || b.end - a.end);
+  let cluster = [];
+  let clusterEnd = 0;
+
+  const flush = () => {
+    const columns = [];
+    for (const seg of cluster) {
+      let col = columns.findIndex(end => end <= seg.start);
+      if (col < 0) col = columns.length;
+      columns[col] = seg.end;
+      seg.col = col;
+    }
+    for (const seg of cluster) seg.cols = columns.length;
+    cluster = [];
+  };
+
+  for (const seg of segments) {
+    if (seg.start >= clusterEnd) flush();
+    cluster.push(seg);
+    clusterEnd = cluster.length === 1 ? seg.end : Math.max(clusterEnd, seg.end);
+  }
+  flush();
+  return segments;
+}
+
+function eventBlock(seg) {
+  const { ev } = seg;
+  const time = `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`;
+  const isShort = seg.end - seg.start < SHORT_EVENT_MINUTES;
+  return h('button', {
+    class: isShort ? 'ev ev--short' : 'ev',
+    type: 'button',
+    '--top': seg.start,
+    '--dur': seg.end - seg.start,
+    '--col': seg.col,
+    '--cols': seg.cols,
+    '--c': colorOf(ev),
+    onclick: e => openPopover(ev, e.currentTarget),
+  },
+    h('strong', {}, titleOf(ev)),
+    h('span', {}, isShort ? fmtTime(ev.start) : time),
+    !isShort && ev.location && h('span', {}, ev.location),
+  );
+}
+
+function renderTimeView(days) {
+  const today = new Date();
+  const previous = $('view').querySelector('.tv');
+  const previousScroll = previous ? previous.scrollTop : null;
+  const count = days.length;
+
+  const headers = days.map(day => h('button', {
+    class: `tv-day${sameDay(day, today) ? ' is-today' : ''}${count === 1 ? ' is-single' : ''}`,
+    type: 'button',
+    'aria-label': fmtLong(day),
+    onclick: () => goTo(day, 'day'),
+  },
+    h('span', { class: 'day-long' }, DAYS[weekdayIndex(day)]),
+    h('span', { class: 'day-short' }, DAYS_SHORT[weekdayIndex(day)]),
+    h('b', {}, day.getDate()),
+  ));
+
+  const allDayCells = days.map(day => h('div', {
+    class: 'tv-allday-cell',
+    ondblclick: () => openEditor(null, { allDay: true, start: day, end: addDays(day, 1) }),
+  }));
+
+  const allDayEvents = allDayPlacements(days).map(({ ev, from, to, lane }) => h('button', {
+    class: 'tv-allday-ev',
+    type: 'button',
+    style: `grid-column:${from + 1} / ${to + 1};grid-row:${lane + 1}`,
+    '--c': colorOf(ev),
+    title: titleOf(ev),
+    onclick: e => openPopover(ev, e.currentTarget),
+  }, titleOf(ev)));
+
+  const hours = Array.from({ length: 23 }, (_, i) => h('div', { class: 'tv-hour', '--h': i + 1, 'data-hour': i + 1 }, `${pad(i + 1)}:00`));
+
+  const columns = days.map(day => h('div', {
+    class: `tv-col${isWeekend(day) ? ' is-weekend' : ''}`,
+    'data-date': fmtDateValue(day),
+  },
+    layoutOverlaps(timedSegments(day)).map(eventBlock),
+    sameDay(day, today) && h('div', { class: 'tv-now-mark' }),
+  ));
+
+  const hasToday = days.some(day => sameDay(day, today));
+  const gutter = h('div', { class: 'tv-gutter' }, hours, hasToday && h('div', { class: 'tv-now-time' }));
+  const body = h('div', { class: 'tv-body', onpointerdown: startDrag, onclick: tapCreate },
+    gutter,
+    columns,
+    hasToday && h('div', { class: 'tv-now-line' }),
+  );
+
+  const scroller = h('div', { class: count === 1 ? 'tv tv--day' : 'tv', '--days': count },
+    h('div', { class: 'tv-sticky' },
+      h('div', { class: 'tv-days' }, h('div', {}), headers),
+      h('div', { class: 'tv-allday' },
+        h('div', { class: 'tv-allday-label' }, 'dia todo'),
+        h('div', { class: 'tv-allday-grid' }, h('div', { class: 'tv-allday-cells' }, allDayCells), allDayEvents),
+      ),
+    ),
+    body,
+  );
+
+  $('view').replaceChildren(scroller);
+  updateNow();
+
+  if (previousScroll !== null) {
+    scroller.scrollTop = previousScroll;
+  } else {
+    const nowY = (minutesOf(today) / DAY_MINUTES) * body.offsetHeight;
+    scroller.scrollTop = Math.max(0, nowY - scroller.clientHeight / 3);
+  }
+}
+
+function updateNow() {
+  const body = $('view').querySelector('.tv-body');
+  if (!body) return;
+  const now = new Date();
+  const minutes = minutesOf(now);
+  body.style.setProperty('--now', minutes);
+
+  const label = body.querySelector('.tv-now-time');
+  if (label) label.textContent = fmtTime(now);
+  for (const hour of body.querySelectorAll('.tv-hour')) {
+    hour.classList.toggle('is-near-now', Boolean(label) && Math.abs(hour.dataset.hour * 60 - minutes) < 12);
+  }
+}
+
+/* Drag to create */
+
+let drag = null;
+let dismissedAt = -1;
+let tapPending = false;
+
+function dragRange() {
+  return { start: Math.min(drag.anchor, drag.current), end: Math.max(drag.anchor, drag.current) };
+}
+
+function pointerMinutes(e, column) {
+  const rect = column.getBoundingClientRect();
+  const minutes = ((e.clientY - rect.top) / rect.height) * DAY_MINUTES;
+  return Math.min(DAY_MINUTES, Math.max(0, Math.round(minutes / SNAP_MINUTES) * SNAP_MINUTES));
+}
+
+function openDraft(day, start, end) {
+  const from = start === end ? Math.min(start, DAY_MINUTES - 60) : start;
+  const to = start === end ? from + 60 : end;
+  openEditor(null, { allDay: false, start: atMinutes(day, from), end: atMinutes(day, to) });
+}
+
+function startDrag(e) {
+  tapPending = false;
+  const column = e.target.closest('.tv-col');
+  if (!column || e.target.closest('.ev') || e.button !== 0 || e.timeStamp === dismissedAt) return;
+
+  // Touch drags scroll the grid. A tap creates an event from the click that follows.
+  if (e.pointerType === 'touch') {
+    tapPending = true;
+    return;
+  }
+
+  const anchor = pointerMinutes(e, column);
+  drag = { column, day: parseDateValue(column.dataset.date), anchor, current: anchor, ghost: null, renderPending: false };
+
+  const body = e.currentTarget;
+  e.preventDefault();
+  body.setPointerCapture(e.pointerId);
+
+  const move = ev => {
+    if (!drag) return;
+    drag.current = pointerMinutes(ev, drag.column);
+    drawGhost();
+  };
+  const finish = ev => {
+    body.removeEventListener('pointermove', move);
+    body.removeEventListener('pointerup', finish);
+    body.removeEventListener('pointercancel', finish);
+    if (!drag) return;
+
+    const { day, renderPending } = drag;
+    const { start, end } = dragRange();
+    const commit = ev.type === 'pointerup';
+    cancelDrag();
+    if (renderPending) render();
+    if (commit) openDraft(day, start, end);
+  };
+
+  body.addEventListener('pointermove', move);
+  body.addEventListener('pointerup', finish);
+  body.addEventListener('pointercancel', finish);
+}
+
+function tapCreate(e) {
+  if (!tapPending) return;
+  tapPending = false;
+  const column = e.target.closest('.tv-col');
+  if (!column || e.target.closest('.ev')) return;
+  const minutes = pointerMinutes(e, column);
+  openDraft(parseDateValue(column.dataset.date), minutes, minutes);
+}
+
+function drawGhost() {
+  const { start, end } = dragRange();
+  if (!drag.ghost) {
+    drag.ghost = h('div', { class: 'ev ev--ghost', '--col': 0, '--cols': 1, '--c': defaultCalendar()?.color || 'var(--accent)' }, h('span', {}));
+    drag.column.append(drag.ghost);
+  }
+  drag.ghost.style.setProperty('--top', start);
+  drag.ghost.style.setProperty('--dur', Math.max(end - start, SNAP_MINUTES));
+  drag.ghost.firstChild.textContent = `${fmtTime(atMinutes(drag.day, start))} – ${fmtTime(atMinutes(drag.day, end))}`;
+}
+
+function cancelDrag() {
+  drag?.ghost?.remove();
+  drag = null;
+}
+
+/* Month view */
+
+function renderMonth() {
+  const today = new Date();
+  const first = monthGridStart(state.date);
+  const days = Array.from({ length: 42 }, (_, i) => addDays(first, i));
+
+  const lists = days.map(() => h('div', { class: 'm-events' }));
+  const cells = days.map((day, i) => {
+    const classes = ['m-day'];
+    if (day.getMonth() !== state.date.getMonth()) classes.push('is-out');
+    if (sameDay(day, today)) classes.push('is-today');
+    if (isWeekend(day)) classes.push('is-weekend');
+    return h('div', {
+      class: classes.join(' '),
+      ondblclick: e => {
+        if (e.target.closest('button')) return;
+        openEditor(null, { allDay: true, start: day, end: addDays(day, 1) });
+      },
+    },
+      h('button', {
+        class: 'm-num',
+        type: 'button',
+        'aria-label': fmtLong(day),
+        onclick: () => goTo(day, 'day'),
+      }, day.getDate()),
+      lists[i],
+    );
+  });
+
+  $('view').replaceChildren(h('div', { class: 'month' },
+    h('div', { class: 'm-head' }, DAYS.map((name, i) => h('div', {},
+      h('span', { class: 'day-long' }, name),
+      h('span', { class: 'day-short' }, DAYS_SHORT[i]),
+    ))),
+    h('div', { class: 'm-grid' }, cells),
+  ));
+
+  // Capacity depends on the rendered cell height, so events are added last.
+  const capacity = Math.max(1, Math.floor(lists[0].clientHeight / MONTH_LINE));
+  const events = visibleEvents();
+  days.forEach((day, i) => {
+    const next = addDays(day, 1);
+    const items = events
+      .filter(ev => ev.start < next && ev.end > day)
+      .sort((a, b) => inAllDayRow(b) - inAllDayRow(a) || a.start - b.start);
+    const shown = items.length > capacity ? items.slice(0, capacity - 1) : items;
+
+    lists[i].append(...shown.map(monthEvent));
+    if (shown.length < items.length) {
+      lists[i].append(h('button', {
+        class: 'm-more',
+        type: 'button',
+        onclick: () => goTo(day, 'day'),
+      }, `+${items.length - shown.length} mais`));
+    }
+  });
+}
+
+function monthEvent(ev) {
+  const allDay = inAllDayRow(ev);
+  return h('button', {
+    class: allDay ? 'm-ev m-ev--all' : 'm-ev',
+    type: 'button',
+    '--c': colorOf(ev),
+    title: titleOf(ev),
+    onclick: e => openPopover(ev, e.currentTarget),
+  },
+    !allDay && h('i', {}),
+    h('span', {}, titleOf(ev)),
+    !allDay && h('time', {}, fmtTime(ev.start)),
+  );
+}
+
+/* Event popover */
+
+let popoverAnchor = null;
+
+function whenText(ev) {
+  if (ev.allDay) {
+    const last = addDays(ev.end, -1);
+    return sameDay(ev.start, last) ? `${fmtLong(ev.start)}, dia todo` : `${fmtLong(ev.start)} – ${fmtLong(last)}`;
+  }
+  if (sameDay(ev.start, ev.end)) return `${fmtLong(ev.start)}, ${fmtTime(ev.start)} – ${fmtTime(ev.end)}`;
+  return `${fmtLong(ev.start)}, ${fmtTime(ev.start)} – ${fmtLong(ev.end)}, ${fmtTime(ev.end)}`;
+}
+
+function popoverActions(ev, calendar) {
+  const canEdit = calendar?.writable;
+  return h('div', { class: 'pop-actions' },
+    canEdit && h('button', { class: 'btn', type: 'button', onclick: () => { closePopover(); openEditor(ev); } }, 'Editar'),
+    canEdit && h('button', { class: 'btn btn-danger', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(confirmDelete(ev, calendar)) }, 'Apagar'),
+    ev.link?.startsWith('https://') && h('a', { class: 'btn', href: ev.link, target: '_blank', rel: 'noopener' }, 'Abrir no Google'),
+  );
+}
+
+function confirmDelete(ev, calendar) {
+  const remove = async () => {
+    try {
+      await backend.remove(ev);
+      closePopover();
+      await refresh();
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+  return h('div', { class: 'pop-actions' },
+    h('p', { class: 'pop-confirm' }, ev.recurring ? 'Este evento repete-se. Só esta ocorrência será apagada.' : 'Apagar este evento?'),
+    h('button', { class: 'btn btn-danger', type: 'button', onclick: remove }, 'Apagar'),
+    h('button', { class: 'btn', type: 'button', onclick: e => e.currentTarget.parentElement.replaceWith(popoverActions(ev, calendar)) }, 'Cancelar'),
+  );
+}
+
+function openPopover(ev, anchor) {
+  const popover = $('popover');
+  const calendar = calendarByKey(ev.calendarKey);
+  popoverAnchor = anchor;
+
+  popover.replaceChildren(
+    h('div', { class: 'pop-head', '--c': colorOf(ev) }, h('i', {}), h('h2', {}, titleOf(ev))),
+    h('p', { class: 'pop-line' }, whenText(ev)),
+    ev.location && h('p', { class: 'pop-line' }, ev.location),
+    calendar && h('p', { class: 'pop-line' }, calendar.name),
+    ev.recurring && h('p', { class: 'pop-line' }, 'Evento repetido'),
+    ev.notes && h('p', { class: 'pop-notes' }, ev.notes),
+    popoverActions(ev, calendar),
+  );
+  popover.hidden = false;
+
+  const margin = 12;
+  const rect = anchor.getBoundingClientRect();
+  const { offsetWidth: width, offsetHeight: height } = popover;
+  let left = rect.right + margin;
+  if (left + width > innerWidth - margin) left = rect.left - width - margin;
+  if (left < margin) left = Math.max(margin, Math.min(rect.left, innerWidth - width - margin));
+  const top = Math.max(margin, Math.min(rect.top, innerHeight - height - margin));
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+  popover.focus();
+}
+
+function closePopover() {
+  const popover = $('popover');
+  if (popover.hidden) return;
+  popover.hidden = true;
+  if (popoverAnchor?.isConnected) popoverAnchor.focus({ preventScroll: true });
+  popoverAnchor = null;
+}
+
+/* Event editor */
+
+const editor = {
+  event: null,
+  durationMs: 3600000,
+  durationDays: 0,
+};
+
+function defaultCalendar() {
+  const writable = writableCalendars();
+  const last = store.get('lastCalendar', null);
+  return writable.find(c => c.key === last) || writable.find(c => c.primary) || writable[0];
+}
+
+function fillCalendarSelect(selectedKey) {
+  const select = $('ed-calendar');
+  const writable = writableCalendars();
+  const option = c => h('option', { value: c.key }, c.name);
+  if (IS_DEMO) {
+    select.replaceChildren(...writable.map(option));
+  } else {
+    select.replaceChildren(...state.accounts
+      .filter(a => a.calendars.some(c => c.writable))
+      .map(a => h('optgroup', { label: a.email }, a.calendars.filter(c => c.writable).map(option))));
+  }
+  select.value = selectedKey;
+}
+
+function openEditor(ev, draft) {
+  if (!ev && !writableCalendars().length) {
+    toast('Adiciona uma conta Google com um calendário editável para criar eventos.');
+    return;
+  }
+  closePopover();
+  closeDrawer();
+  editor.event = ev || null;
+
+  const source = ev || draft;
+  const allDay = source.allDay;
+  const lastDay = allDay ? addDays(source.end, -1) : source.end;
+
+  $('editor-title').textContent = ev ? 'Editar evento' : 'Novo evento';
+  $('ed-title').value = ev ? ev.title : '';
+  $('ed-allday').checked = allDay;
+  $('ed-start-date').value = fmtDateValue(source.start);
+  $('ed-end-date').value = fmtDateValue(lastDay);
+  $('ed-start-time').value = allDay ? '09:00' : fmtTime(source.start);
+  $('ed-end-time').value = allDay ? '10:00' : fmtTime(source.end);
+  $('ed-location').value = ev ? ev.location : '';
+  $('ed-notes').value = ev ? ev.notes : '';
+  fillCalendarSelect(ev ? ev.calendarKey : defaultCalendar().key);
+
+  const hint = $('ed-hint');
+  hint.hidden = !ev?.recurring;
+  hint.textContent = 'Este evento repete-se. Só esta ocorrência será alterada.';
+  showEditorError('');
+  toggleAllDay();
+  rememberDuration();
+
+  $('editor').showModal();
+  $('ed-title').focus();
+}
+
+function showEditorError(message) {
+  const el = $('ed-error');
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+function toggleAllDay() {
+  $('editor-form').classList.toggle('is-all-day', $('ed-allday').checked);
+}
+
+function readBound(dateId, timeId) {
+  const date = $(dateId).value;
+  if (!date) return null;
+  const day = parseDateValue(date);
+  if ($('ed-allday').checked) return day;
+  const minutes = parseTime($(timeId).value);
+  return minutes === null ? null : atMinutes(day, minutes);
+}
+
+const readStart = () => readBound('ed-start-date', 'ed-start-time');
+const readEnd = () => readBound('ed-end-date', 'ed-end-time');
+
+function rememberDuration() {
+  const start = readStart();
+  const end = readEnd();
+  if (!start || !end || end < start) return;
+  if ($('ed-allday').checked) editor.durationDays = dayDiff(start, end);
+  else editor.durationMs = end - start;
+}
+
+function followStart() {
+  const start = readStart();
+  if (!start) return;
+  const allDay = $('ed-allday').checked;
+  const end = allDay ? addDays(start, editor.durationDays) : new Date(start.getTime() + editor.durationMs);
+  $('ed-end-date').value = fmtDateValue(end);
+  if (!allDay) $('ed-end-time').value = fmtTime(end);
+}
+
+function normaliseTimeField(input) {
+  const minutes = parseTime(input.value);
+  if (minutes !== null) input.value = fmtTime(atMinutes(new Date(2000, 0, 1), minutes));
+}
+
+function readEditor() {
+  const allDay = $('ed-allday').checked;
+  const start = readStart();
+  const end = readEnd();
+  if (!start || !end) {
+    showEditorError(allDay ? 'Indica as datas de início e de fim.' : 'Indica datas e horas válidas, por exemplo 09:30.');
+    return null;
+  }
+  if (allDay ? end < start : end <= start) {
+    showEditorError('O fim tem de ser depois do início.');
+    return null;
+  }
+  return {
+    title: $('ed-title').value.trim(),
+    allDay,
+    start,
+    end: allDay ? addDays(end, 1) : end,
+    calendarKey: $('ed-calendar').value,
+    location: $('ed-location').value.trim(),
+    notes: $('ed-notes').value.trim(),
+  };
+}
+
+async function saveEditor(e) {
+  e.preventDefault();
+  const data = readEditor();
+  if (!data) return;
+
+  const button = $('ed-save');
+  button.disabled = true;
+  try {
+    if (editor.event) await backend.update(editor.event, data);
+    else await backend.create(data);
+    store.set('lastCalendar', data.calendarKey);
+    $('editor').close();
+    await refresh();
+  } catch (err) {
+    showEditorError(err.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* Sidebar */
+
+const isPhone = () => matchMedia('(max-width: 760px)').matches;
+
+function closeDrawer() {
+  document.body.classList.remove('drawer-open');
+}
+
+function toggleSidebar() {
+  if (isPhone()) {
+    document.body.classList.toggle('drawer-open');
+    return;
+  }
+  const hidden = document.body.classList.toggle('sidebar-hidden');
+  store.set('sidebarHidden', hidden);
+  if (state.view === 'month') renderView();
+}
+
+/* Events */
+
+function bindEvents() {
+  $('prev').addEventListener('click', () => step(-1));
+  $('next').addEventListener('click', () => step(1));
+  $('today').addEventListener('click', () => goTo(new Date()));
+  $('new-event').addEventListener('click', newEvent);
+  $('toggle-sidebar').addEventListener('click', toggleSidebar);
+  $('scrim').addEventListener('click', closeDrawer);
+  $('add-account').addEventListener('click', () => connectAccount('', 'select_account'));
+  $('reauth').addEventListener('click', () => {
+    // One popup per click: a second one would be blocked after the first closes.
+    const [account] = expiredAccounts();
+    if (account) connectAccount(account.email, '');
+  });
+
+  for (const button of $('views').children) {
+    button.addEventListener('click', () => goTo(state.date, button.dataset.view));
+  }
+
+  $('mini-prev').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, -1); renderMini(); });
+  $('mini-next').addEventListener('click', () => { state.miniMonth = addMonths(state.miniMonth, 1); renderMini(); });
+
+  $('editor-form').addEventListener('submit', saveEditor);
+  $('ed-cancel').addEventListener('click', () => $('editor').close());
+  $('ed-allday').addEventListener('change', () => { toggleAllDay(); rememberDuration(); });
+  $('ed-start-date').addEventListener('change', followStart);
+  $('ed-end-date').addEventListener('change', rememberDuration);
+  for (const [id, onChange] of [['ed-start-time', followStart], ['ed-end-time', rememberDuration]]) {
+    $(id).addEventListener('change', e => { normaliseTimeField(e.target); onChange(); });
+  }
+
+  document.addEventListener('pointerdown', e => {
+    const popover = $('popover');
+    if (popover.hidden || popover.contains(e.target)) return;
+    dismissedAt = e.timeStamp;
+    closePopover();
+  }, true);
+
+  document.addEventListener('keydown', onKeydown);
+
+  let lastFocusRefresh = 0;
+  const refreshOnFocus = () => {
+    if (document.hidden || Date.now() - lastFocusRefresh < FOCUS_THROTTLE) return;
+    lastFocusRefresh = Date.now();
+    refresh();
+  };
+  addEventListener('focus', refreshOnFocus);
+  document.addEventListener('visibilitychange', refreshOnFocus);
+  setInterval(refresh, SYNC_INTERVAL);
+
+  let resizeFrame;
+  new ResizeObserver(() => {
+    cancelAnimationFrame(resizeFrame);
+    resizeFrame = requestAnimationFrame(() => {
+      if (state.view === 'month') renderMonth();
+    });
+  }).observe($('view'));
+
+  let installPrompt = null;
+  addEventListener('beforeinstallprompt', e => {
+    e.preventDefault();
+    installPrompt = e;
+    $('install').hidden = false;
+  });
+  addEventListener('appinstalled', () => { $('install').hidden = true; });
+  $('install').addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    installPrompt = null;
+    $('install').hidden = true;
+  });
+}
+
+function newEvent() {
+  const now = new Date();
+  const base = sameDay(state.date, now) ? now : atMinutes(state.date, 9 * 60);
+  const start = atMinutes(base, Math.ceil(minutesOf(base) / 60) * 60);
+  openEditor(null, { allDay: false, start, end: new Date(start.getTime() + 3600000) });
+}
+
+function onKeydown(e) {
+  if (e.key === 'Escape') {
+    if (drag) {
+      const { renderPending } = drag;
+      cancelDrag();
+      if (renderPending) render();
+    }
+    closePopover();
+    closeDrawer();
+    return;
+  }
+
+  const typing = e.target.closest?.('input:not([type="checkbox"]), textarea, select, [contenteditable]');
+  if (typing || e.ctrlKey || e.metaKey || e.altKey || $('editor').open) return;
+
+  const actions = {
+    arrowleft: () => step(-1),
+    arrowright: () => step(1),
+    t: () => goTo(new Date()),
+    d: () => goTo(state.date, 'day'),
+    s: () => goTo(state.date, 'week'),
+    m: () => goTo(state.date, 'month'),
+    n: newEvent,
+  };
+  const action = actions[e.key.toLowerCase()];
+  if (action) {
+    e.preventDefault();
+    action();
+  }
+}
+
+/* Clock */
+
+let lastTick = new Date();
+function tick() {
+  const now = new Date();
+  if (sameDay(now, lastTick)) updateNow();
+  else render();
+  lastTick = now;
+  renderSession();
+  setTimeout(tick, 60000 - (Date.now() % 60000));
+}
+
+/* Start */
+
+function start() {
+  if (store.get('sidebarHidden', false)) document.body.classList.add('sidebar-hidden');
+  $('time-options').append(...Array.from({ length: 48 }, (_, i) => h('option', { value: `${pad(Math.floor(i / 2))}:${pad((i % 2) * 30)}` })));
+
+  bindEvents();
+  if (!IS_DEMO) {
+    loadGoogleScript();
+    state.calendars = state.accounts.flatMap(a => a.calendars);
+  }
+  render();
+  refresh();
+  tick();
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+}
+
+start();
