@@ -429,7 +429,9 @@ async function fetchAccessToken(account) {
   const res = await authPost('/auth/refresh', { session: account.session });
   if (res.status === 401) throw endSession(account);
   if (!res.ok) throw new Error('Não foi possível renovar o acesso. Tenta de novo.');
-  const { access_token: token, expires_in: expiresIn } = await res.json();
+  const { access_token: token, expires_in: expiresIn, session } = await res.json();
+  account.session = session;
+  saveAccounts();
   return { token, expiresAt: Date.now() + expiresIn * 1000 };
 }
 

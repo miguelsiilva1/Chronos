@@ -122,17 +122,18 @@ Shortcuts are off while you type in a field.
 | `manifest.webmanifest` | PWA name, icons and display mode |
 | `sw.js` | Caches the app shell, network first. It never touches Google requests |
 | `worker/` | Cloudflare Worker that exchanges and renews Google tokens |
+| `fonts/` | Inter, served with the app, and its license |
 | `icons/` | App icon as SVG and PNG |
 | `docs/` | Screenshots for this README |
 
 The browser calls the Calendar API directly, so events never pass through the Worker.
 
-The Worker holds the client secret. It encrypts each refresh token with AES-GCM and returns it to the browser as an opaque session. The Worker stores nothing. Access tokens stay in memory and last 1 hour.
+The Worker holds the client secret. It encrypts each refresh token with AES-GCM and returns it to the browser as an opaque session, which changes on every renewal. The Worker stores nothing. Access tokens stay in memory and last 1 hour.
 
 ## Limitations
 
 - **The app is not verified by Google.** Sign-in shows a warning, and Google caps unverified apps at 100 users for the life of the project.
-- **A session lasts until you remove the account or revoke access.** The encrypted session stays in `localStorage`, so anyone who controls your browser profile can use it. Do not use Chronos on a shared computer.
+- **A session ends after 90 days without use, or when you remove the account or revoke access.** The encrypted session stays in `localStorage`, so anyone who controls your browser profile can use it. Do not use Chronos on a shared computer.
 - **Reconnecting needs one click per account.** If Google ends a session, Chronos keeps your calendar list and shows **Sessão expirada · reativar** at the top.
 - **Removing an account ends its access everywhere.** Revoking the grant also signs Chronos out on your other devices.
 - **Moving a repeating occurrence creates a new event.** The Calendar API cannot move a single instance, so Chronos creates a one-off event and deletes that occurrence. The same applies to moves between accounts. Guests and attachments are not copied.

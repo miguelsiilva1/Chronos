@@ -3,6 +3,7 @@ const REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 
 const MAX_BODY_BYTES = 8192;
+const MAX_IDLE_MS = 90 * 24 * 60 * 60 * 1000;
 const IV_BYTES = 12;
 const ADDITIONAL_DATA = new TextEncoder().encode('chronos-session-v1');
 
@@ -16,7 +17,7 @@ function sessionKey(env) {
 // The refresh token leaves this Worker only inside this blob. Nothing is stored here.
 async function seal(env, refreshToken) {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const data = new TextEncoder().encode(refreshToken);
+  const data = new TextEncoder().encode(JSON.stringify({ refreshToken, sealedAt: Date.now() }));
   const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: ADDITIONAL_DATA }, await sessionKey(env), data);
   return toBase64Url(new Uint8Array([...iv, ...new Uint8Array(cipher)]));
 }
@@ -29,7 +30,9 @@ async function open(env, session) {
       await sessionKey(env),
       bytes.slice(IV_BYTES),
     );
-    return new TextDecoder().decode(plain);
+    const text = new TextDecoder().decode(plain);
+    // The first sessions held the bare token. They get a date on their next refresh.
+    return text.startsWith('{') ? JSON.parse(text) : { refreshToken: text, sealedAt: Date.now() };
   } catch {
     return null;
   }
@@ -114,11 +117,16 @@ async function handleExchange(env, body, origin) {
 }
 
 async function handleRefresh(env, body, origin) {
-  const refreshToken = typeof body?.session === 'string' ? await open(env, body.session) : null;
-  if (!refreshToken) return respond(401, { error: 'reauth' }, origin);
+  const opened = typeof body?.session === 'string' ? await open(env, body.session) : null;
+  if (!opened) return respond(401, { error: 'reauth' }, origin);
+
+  if (Date.now() - opened.sealedAt > MAX_IDLE_MS) {
+    await postForm(REVOKE_URL, { token: opened.refreshToken });
+    return respond(401, { error: 'reauth' }, origin);
+  }
 
   const res = await postForm(TOKEN_URL, {
-    refresh_token: refreshToken,
+    refresh_token: opened.refreshToken,
     client_id: env.GOOGLE_CLIENT_ID,
     client_secret: env.GOOGLE_CLIENT_SECRET,
     grant_type: 'refresh_token',
@@ -126,12 +134,16 @@ async function handleRefresh(env, body, origin) {
   const data = await res.json();
   if (data.error === 'invalid_grant') return respond(401, { error: 'reauth' }, origin);
   if (!res.ok) return respond(502, { error: 'upstream' }, origin);
-  return respond(200, { access_token: data.access_token, expires_in: data.expires_in }, origin);
+  return respond(200, {
+    access_token: data.access_token,
+    expires_in: data.expires_in,
+    session: await seal(env, data.refresh_token || opened.refreshToken),
+  }, origin);
 }
 
 async function handleRevoke(env, body, origin) {
-  const refreshToken = typeof body?.session === 'string' ? await open(env, body.session) : null;
-  if (refreshToken) await postForm(REVOKE_URL, { token: refreshToken });
+  const opened = typeof body?.session === 'string' ? await open(env, body.session) : null;
+  if (opened) await postForm(REVOKE_URL, { token: opened.refreshToken });
   return respond(204, null, origin);
 }
 

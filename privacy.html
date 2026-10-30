@@ -2,11 +2,10 @@
 <html lang="pt-PT">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Privacidade do Chronos</title>
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body class="legal-page">
@@ -25,11 +24,11 @@
     <h2>Onde ficam os dados</h2>
     <p>Os eventos são pedidos diretamente pelo teu browser ao Google e não passam por nenhum servidor do Chronos. Não são guardados pelo Chronos.</p>
     <p>No teu browser ficam guardados o teu email, a lista de calendários, as tuas preferências e uma chave de sessão cifrada.</p>
-    <p>Um pequeno serviço do Chronos no Cloudflare Workers renova o acesso ao Google. Recebe essa chave de sessão apenas para pedir um novo acesso e não guarda nenhum dado.</p>
+    <p>Um pequeno serviço do Chronos no Cloudflare Workers renova o acesso ao Google. Recebe essa chave de sessão apenas para pedir um novo acesso e não guarda nenhum dado. A sessão termina ao fim de 90 dias sem uso.</p>
 
     <h2>Partilha de dados</h2>
     <p>O Chronos não vende, não partilha e não usa os teus dados para publicidade. Não usa ferramentas de análise nem cookies de rastreio.</p>
-    <p>Para carregar a app, o teu browser liga-se ao GitHub Pages, ao Cloudflare e ao Google, incluindo o Google Fonts. Estes serviços recebem dados técnicos normais, como o endereço IP.</p>
+    <p>Para usar a app, o teu browser liga-se ao GitHub Pages, ao Cloudflare e ao Google. Estes serviços recebem dados técnicos normais, como o endereço IP.</p>
 
     <h2>Google API Services</h2>
     <p>O uso e a transferência de informação recebida das APIs Google cumprem a <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, incluindo os requisitos de Limited Use.</p>

@@ -1,4 +1,4 @@
-const CACHE = 'chronos-v3';
+const CACHE = 'chronos-v4';
 
 const SHELL = [
   './',
@@ -9,6 +9,7 @@ const SHELL = [
   'app.js',
   'config.js',
   'manifest.webmanifest',
+  'fonts/inter-latin-wght-normal.woff2',
   'icons/icon.svg',
   'icons/icon-192.png',
   'icons/icon-512.png',

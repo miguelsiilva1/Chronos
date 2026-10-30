@@ -9,4 +9,4 @@ ALLOWED_ORIGINS = "https://miguelsiilva1.github.io,http://localhost:8000"
 [[ratelimits]]
 name = "LIMITER"
 namespace_id = "1001"
-simple = { limit = 60, period = 60 }
+simple = { limit = 30, period = 60 }
