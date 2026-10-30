@@ -1308,6 +1308,8 @@ function closeCalendarPanel() {
   panel.searching = false;
   panel.run++;
   $('cal-panel').hidden = true;
+  // Removing the search field also releases its focus, so shortcuts work straight away.
+  $('cal-panel').replaceChildren();
   renderSidebar();
 }
 
